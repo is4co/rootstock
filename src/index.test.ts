@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
-import { ROOTSTOCK } from './index'
+import { UnsupportedError } from './index'
 
-test('package identity', () => {
-  expect(ROOTSTOCK).toBe('@is4co/rootstock')
+test('the contract is reachable from the entry point', () => {
+  expect(new UnsupportedError('resume').code).toBe('ERR_UNSUPPORTED')
 })
