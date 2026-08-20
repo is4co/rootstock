@@ -1,0 +1,10 @@
+# The grind harness writes a per-worktree .env (APP_URL, PORT) on provisioning.
+# It is lane-local and must never be committed.
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+*.log
+.DS_Store
