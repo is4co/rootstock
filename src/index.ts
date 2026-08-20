@@ -4,4 +4,5 @@
 export * from './types'
 export * from './registry'
 export * from './drivers/scripted'
+export * from './drivers/claude-code'
 export * from './conformance'
