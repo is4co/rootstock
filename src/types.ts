@@ -50,6 +50,18 @@ export type AgentEvent =
    * `after` is the new content (whole file, or the replaced span when `range`
    * is present); `before` is the prior content where the driver knows it.
    * Drives the code-scrolling animation and the per-page change summary.
+   *
+   * `range` locates `after` in the file as it was **before** this edit:
+   * `startLine`/`endLine` are 1-based and both endpoints are inclusive, so a
+   * consumer holding the pre-edit content applies the edit as
+   * `lines.splice(startLine - 1, endLine - startLine + 1, ...after.split('\n'))`.
+   * A one-line replacement is `{ startLine: n, endLine: n }`.
+   *
+   * The two fields are read together, and a driver owes the pair: `range`
+   * present means `after` is only that span, and `range` absent means `after`
+   * is the whole file. A driver that knows the span but cannot number it must
+   * NOT emit a range-less `file.edit` — that reads as "replace the file with
+   * this fragment" and truncates it. Such an edit belongs in `tool.other`.
    */
   | { kind: 'file.edit'; path: string; after: string; before?: string; range?: { startLine: number; endLine: number } }
   | { kind: 'file.create'; path: string; after: string }

@@ -22,6 +22,12 @@ import { createScriptedDriver } from '../drivers/scripted'
 import type { ConformanceOptions, ConformanceScenario } from './index'
 import { CONFORMANCE_NOTE, CONFORMANCE_PROBE, CONFORMANCE_TASKS, runConformance } from './index'
 
+/** The `stream` turn's text as one block — what a driver that does not really
+ *  stream delivers, whether it declares that honestly or not. */
+const STREAM_TEXT =
+  'Movable type reached Europe in the 1400s. Gutenberg made it practical.' +
+  ' Presses spread across the continent. Books grew cheap. Literacy followed.'
+
 const USAGE: TurnUsage = { inputTokens: 100, outputTokens: 50, costUsd: 0.01, wallClockMs: 12, turns: 1 }
 const END: AgentEvent = { kind: 'turn.end', stopReason: 'completed', usage: USAGE }
 
@@ -52,14 +58,32 @@ function fixtureFor(scenario: ConformanceScenario, caps: DriverCapabilities): Sc
     case 'echo':
       return {
         version: 1,
-        turns: [{
-          match: CONFORMANCE_TASKS.echo,
-          steps: ended(
-            { kind: 'status', status: 'working' },
-            { kind: 'message.delta', text: 'Ack' },
-            { kind: 'message.delta', text: 'nowledged.' },
-          ),
-        }],
+        turns: [
+          {
+            match: CONFORMANCE_TASKS.echo,
+            steps: ended(
+              { kind: 'status', status: 'working' },
+              { kind: 'message.delta', text: 'Ack' },
+              { kind: 'message.delta', text: 'nowledged.' },
+            ),
+          },
+          {
+            // The streaming stimulus, taken as a second turn on the same
+            // session. The `true` branch streams it in pieces; the `false`
+            // branch delivers the identical text in exactly one delta, which
+            // is what that degradation promises — coarse, never missing.
+            match: CONFORMANCE_TASKS.stream,
+            steps: caps.streamingText
+              ? ended(
+                  { kind: 'message.delta', text: 'Movable type reached Europe in the 1400s.' },
+                  { kind: 'message.delta', text: ' Gutenberg made it practical.' },
+                  { kind: 'message.delta', text: ' Presses spread across the continent.' },
+                  { kind: 'message.delta', text: ' Books grew cheap.' },
+                  { kind: 'message.delta', text: ' Literacy followed.' },
+                )
+              : ended({ kind: 'message.delta', text: STREAM_TEXT }),
+          },
+        ],
       }
     case 'fileChange':
       return {
@@ -71,8 +95,9 @@ function fixtureFor(scenario: ConformanceScenario, caps: DriverCapabilities): Sc
             {
               kind: 'file.edit',
               path: 'web/pages/home.tsx',
-              before: 'export default function Home() {\n  return <h1>Welcome</h1>\n}\n',
-              after: 'export default function Home() {\n  return <h1>Hello</h1>\n}\n',
+              // `range` present, so `after` is that span alone — not the file.
+              before: '  return <h1>Welcome</h1>',
+              after: '  return <h1>Hello</h1>',
               range: { startLine: 2, endLine: 2 },
             },
           ),
@@ -216,6 +241,44 @@ function leakAFileEvent(session: Session): Session {
   }
 }
 
+/**
+ * Declares `streamingText: true` and batches each turn's text into a single
+ * `message.delta` — exactly what a driver that does not really stream looks
+ * like from outside. This is the negative that keeps `cap.streamingText`
+ * honest: if the check could not fail this driver, moving the streaming proof
+ * off the echo task would have quietly turned it into a check that passes
+ * anything.
+ */
+function batchDeltas(session: Session): Session {
+  const events: AsyncIterable<AgentEvent> = {
+    [Symbol.asyncIterator]: async function* (): AsyncGenerator<AgentEvent> {
+      let buffered = ''
+      for await (const event of session.events) {
+        if (event.kind === 'message.delta') {
+          buffered += event.text
+          continue
+        }
+        if (event.kind === 'turn.end' && buffered.length > 0) {
+          yield { kind: 'message.delta', text: buffered }
+          buffered = ''
+        }
+        yield event
+      }
+      if (buffered.length > 0) yield { kind: 'message.delta', text: buffered }
+    },
+  }
+  return {
+    id: session.id,
+    events,
+    send: (text: string, opts?: Parameters<Session['send']>[1]) => session.send(text, opts),
+    status: () => session.status(),
+    interject: (note: string) => session.interject(note),
+    interrupt: () => session.interrupt(),
+    usage: () => session.usage(),
+    close: () => session.close(),
+  }
+}
+
 const CONFIGS: { name: string; capabilities: Partial<DriverCapabilities> }[] = [
   { name: 'every capability true', capabilities: {} },
   { name: 'every capability false', capabilities: ALL_FALSE },
@@ -263,5 +326,14 @@ describe('the suite has teeth', () => {
     expect(report.ok).toBe(false)
     expect(report.checks.filter((check) => !check.ok).map((check) => check.id)).toEqual(['cap.fileEvents'])
     expect(report.checks.find((check) => check.id === 'cap.fileEvents')?.detail).toContain('file.*')
+  })
+
+  test('a lying driver fails: streamingText declared true while every turn arrives in one delta', async () => {
+    const rig = scriptedRig({}, batchDeltas)
+    const report = await runConformance(rig.driver, rig.opts)
+
+    expect(report.ok).toBe(false)
+    expect(report.checks.filter((check) => !check.ok).map((check) => check.id)).toContain('cap.streamingText')
+    expect(report.checks.find((check) => check.id === 'cap.streamingText')?.detail).toContain('produced 1')
   })
 })

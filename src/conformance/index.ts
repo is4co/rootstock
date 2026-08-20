@@ -12,7 +12,7 @@
 // options. That is what makes it valid for drivers that do not exist yet:
 // engine-specific wiring lives in the caller's `makeSession`, never here.
 
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -38,9 +38,47 @@ import type {
  * scripted fixture binds to them with `match`; an engine driver receives them
  * as real prompts in a temp worktree.
  */
+/**
+ * The file the suite writes into the `fileChange` scenario's worktree, and the
+ * edit it asks for. The suite seeds this itself rather than trusting the
+ * caller's `makeWorkspace` to have put anything in particular there — a prompt
+ * that names an exact file cannot depend on a workspace it does not control.
+ */
+export const CONFORMANCE_EDIT_FILE = 'conformance-target.txt'
+
+/** Four lines and a trailing newline. `CONFORMANCE_EDIT_OLD` occurs exactly
+ *  once in it, so the span it names is unambiguous. */
+export const CONFORMANCE_EDIT_CONTENT = 'alpha\nbeta\ngamma\ndelta\n'
+
+/** The line to replace, and what to replace it with. */
+export const CONFORMANCE_EDIT_OLD = 'gamma'
+export const CONFORMANCE_EDIT_NEW = 'gamma-edited'
+
 export const CONFORMANCE_TASKS = {
   echo: 'conformance: reply with a short acknowledgement',
-  fileChange: 'conformance: make a small edit to a file in this workspace',
+  /**
+   * The streaming stimulus, deliberately separate from `echo`. A prompt that
+   * asks for a *short* acknowledgement cannot also be the proof of token-wise
+   * streaming: a terse enough reply arrives in one chunk and the check becomes
+   * a coin flip on how brief the model felt like being. This one asks for
+   * enough prose that a driver which streams produces many deltas and a driver
+   * which batches still produces exactly one.
+   */
+  stream:
+    'conformance: write a plain-prose paragraph of at least five sentences about the history of ' +
+    'the printing press. Do not use any tools, and do not ask any questions.',
+  /**
+   * Names the file, quotes the exact line and its replacement, and forbids
+   * clarifying questions. The earlier wording ("make a small edit to a file in
+   * this workspace") named no file and no change, and a real engine answered it
+   * by asking which file and what change — producing no edit, and so no
+   * `file.*` event, which read as a driver defect rather than a vague prompt.
+   */
+  fileChange:
+    `conformance: this workspace contains a file named ${CONFORMANCE_EDIT_FILE} in the current ` +
+    `working directory. Read it, then use the Edit tool to replace the single line ` +
+    `"${CONFORMANCE_EDIT_OLD}" with "${CONFORMANCE_EDIT_NEW}". Change nothing else, and do not ask ` +
+    `any clarifying questions - the file and the edit are both fully specified.`,
   toolCall: 'conformance: call the injected probe tool',
   followup: 'conformance: follow-up turn',
 } as const
@@ -267,6 +305,9 @@ interface EchoOutcome {
   sendResolved: boolean
   reachedTurnEnd: boolean
   deltas: number
+  /** Deltas from the `stream` turn alone — what `cap.streamingText` grades. */
+  streamDeltas: number
+  streamTurnReached: boolean
   usageAfterTurn: TurnUsage | null
   hookCallsAfterTurn: number
   closeError: string | null
@@ -463,6 +504,8 @@ class ConformanceRun {
       sendResolved: false,
       reachedTurnEnd: false,
       deltas: 0,
+      streamDeltas: 0,
+      streamTurnReached: false,
       usageAfterTurn: null,
       hookCallsAfterTurn: 0,
       closeError: null,
@@ -488,6 +531,20 @@ class ConformanceRun {
       outcome.deltas = collector.events.filter((event) => event.kind === 'message.delta').length
       outcome.usageAfterTurn = this.snapshotUsage(session)
       outcome.hookCallsAfterTurn = this.hookCalls
+
+      // The streaming proof: a second turn on this same session, so it costs
+      // one turn rather than a whole extra scenario and session. Only this
+      // turn's deltas are counted, which is why the mark is taken first.
+      const streamFrom = collector.events.length
+      await session.send(CONFORMANCE_TASKS.stream)
+      outcome.streamTurnReached = await collector.waitFor(
+        () => turnEndsIn(collector.events).length >= 2,
+        this.timeout,
+        () => { this.note(session) },
+      )
+      outcome.streamDeltas = collector.events
+        .slice(streamFrom)
+        .filter((event) => event.kind === 'message.delta').length
 
       // A second snapshot on the same session, so 'never decreases' is graded
       // on every run rather than only where a scenario takes two turns.
@@ -515,7 +572,11 @@ class ConformanceRun {
   private async runFileChange(): Promise<FileOutcome> {
     const outcome: FileOutcome = { reachedTurnEnd: false, fileEvents: [] }
     try {
-      const { session, collector } = await this.open('fileChange')
+      const { session, collector, options } = await this.open('fileChange')
+      // Seeded after the session is opened but before the turn is sent: every
+      // driver here starts its engine lazily on the first send, so the file is
+      // on disk before anything can look for it.
+      await writeFile(join(options.worktree, CONFORMANCE_EDIT_FILE), CONFORMANCE_EDIT_CONTENT)
       await session.send(CONFORMANCE_TASKS.fileChange)
       this.note(session)
       outcome.reachedTurnEnd = await collector.waitFor(
@@ -865,11 +926,12 @@ class ConformanceRun {
 
     this.grade('cap.streamingText', () => {
       if (echo.error !== undefined) return `echo scenario failed: ${echo.error}`
+      if (!echo.streamTurnReached) return `the stream task never reached turn.end within ${this.timeout}ms`
       const floor = caps.streamingText ? 2 : 1
-      if (echo.deltas < floor) {
+      if (echo.streamDeltas < floor) {
         return caps.streamingText
-          ? `streamingText: true promises token-wise deltas; the echo task produced ${echo.deltas}`
-          : `streamingText: false still promises the text arrives; the echo task produced ${echo.deltas} message.delta events`
+          ? `streamingText: true promises token-wise deltas; the stream task produced ${echo.streamDeltas}`
+          : `streamingText: false still promises the text arrives; the stream task produced ${echo.streamDeltas} message.delta events`
       }
       return null
     })

@@ -154,6 +154,16 @@ export interface NormalizerState {
   /** tool_use id → the tool that issued it, so its result can be classified. */
   readonly toolUses: Map<string, { name: string; input: Rec }>
   /**
+   * Absolute path → the file's lines as the driver last knew them, dense from
+   * line 1. Seeded from `Write` content and from `Read` results, and kept
+   * current as each `Edit` applies — which is what lets `file.edit` carry a
+   * pre-edit `range` without the normalizer ever touching the filesystem.
+   *
+   * A windowed `Read` pads the prefix it never showed with empty lines, so a
+   * line number derived from this array is the real one either way.
+   */
+  readonly files: Map<string, string[]>
+  /**
    * The engine reports `total_cost_usd` cumulatively across a streaming-input
    * session, so a turn's own cost is the delta against the previous result.
    */
@@ -165,6 +175,7 @@ export interface NormalizerState {
 export function createNormalizerState(worktree?: string): NormalizerState {
   return {
     toolUses: new Map(),
+    files: new Map(),
     totalCostUsd: 0,
     ...(worktree === undefined ? {} : { worktree }),
   }
@@ -185,7 +196,7 @@ export function createNormalizerState(worktree?: string): NormalizerState {
  * | --- | --- |
  * | `stream_event` → `content_block_delta` / `text_delta` | `message.delta` |
  * | `assistant` `tool_use`, tool `Write` | `file.create` |
- * | `assistant` `tool_use`, tools `Edit` / `MultiEdit` / `NotebookEdit` | `file.edit` |
+ * | `assistant` `tool_use`, tools `Edit` / `MultiEdit` | `file.edit` (with `range`) |
  * | `assistant` `tool_use`, tool `Bash` | `command.run` (+ best-effort `file.delete`) |
  * | `user` `tool_result` for a Bash `tool_use` | `command.output` |
  * | any other `tool_use` and its results | `tool.other` — opaque but carried, never dropped |
@@ -249,32 +260,36 @@ function toolUseEvents(name: string, input: Rec, state?: NormalizerState): Agent
     case 'Write': {
       const path = str(input['file_path'])
       const after = str(input['content'])
-      if (path !== undefined && after !== undefined) return [{ kind: 'file.create', path, after }]
+      if (path !== undefined && after !== undefined) {
+        // `file.create` carries the whole file, so it needs no range — but the
+        // content is exactly what a later `Edit` on this path needs to locate
+        // its span against.
+        state?.files.set(path, after.split('\n'))
+        return [{ kind: 'file.create', path, after }]
+      }
       break
     }
     case 'Edit': {
       const path = str(input['file_path'])
-      const edit = editEvent(path, input)
+      const edit = editEvent(path, input, state)
       if (edit !== undefined) return [edit]
       break
     }
     case 'MultiEdit': {
       const path = str(input['file_path'])
       const edits = asArray(input['edits'])
-        .map((raw) => editEvent(path, asRecord(raw) ?? {}))
+        // Sequential by construction: each sub-edit updates the tracked lines,
+        // so the next one's range reflects the shift the previous one caused.
+        .map((raw) => editEvent(path, asRecord(raw) ?? {}, state))
         .filter((event): event is AgentEvent => event !== undefined)
       if (edits.length > 0) return edits
       break
     }
-    case 'NotebookEdit': {
-      const path = str(input['notebook_path']) ?? str(input['file_path'])
-      const after = str(input['new_source'])
-      const before = str(input['old_source'])
-      if (path !== undefined && after !== undefined) {
-        return [{ kind: 'file.edit', path, after, ...(before === undefined ? {} : { before }) }]
-      }
-      break
-    }
+    // `NotebookEdit` deliberately has no case: its `new_source` is one cell of
+    // a JSON notebook, so neither a whole-file `after` nor a line range is
+    // meaningful for it, and a `file.edit` carrying a fragment with no `range`
+    // is the exact ambiguity this driver no longer emits. It falls through to
+    // `tool.other` below — opaque and collapsible, never dropped.
     case 'Bash': {
       const command = str(input['command'])
       if (command !== undefined) {
@@ -292,11 +307,95 @@ function toolUseEvents(name: string, input: Rec, state?: NormalizerState): Agent
   return [{ kind: 'tool.other', name, payload: input }]
 }
 
-function editEvent(path: string | undefined, edit: Rec): AgentEvent | undefined {
+/**
+ * An `Edit` names the span it replaces by quoting it, not by numbering it, so
+ * the range has to be recovered from the content the driver has been tracking.
+ * Declining (returning undefined) is a real outcome, not a failure: the caller
+ * degrades to `tool.other`, which keeps the invariant that matters — this
+ * driver never emits a fragment `after` without the `range` that locates it.
+ */
+function editEvent(path: string | undefined, edit: Rec, state?: NormalizerState): AgentEvent | undefined {
   const after = str(edit['new_string'])
   const before = str(edit['old_string'])
-  if (path === undefined || after === undefined) return undefined
-  return { kind: 'file.edit', path, after, ...(before === undefined ? {} : { before }) }
+  if (path === undefined || after === undefined || before === undefined) return undefined
+  const range = rangeOf(state, path, before)
+  if (range === undefined) return undefined
+  applyEdit(state, path, before, after)
+  return { kind: 'file.edit', path, after, before, range }
+}
+
+/**
+ * The pre-edit span `old` occupies: 1-based, both endpoints inclusive. Undefined
+ * when the driver holds no content for the path, when `old` is not in it, or
+ * when it appears more than once — an ambiguous match would produce a
+ * confidently wrong range, which is worse for the consumer than none.
+ */
+function rangeOf(
+  state: NormalizerState | undefined,
+  path: string,
+  old: string,
+): { startLine: number; endLine: number } | undefined {
+  const lines = state?.files.get(path)
+  if (lines === undefined || old.length === 0) return undefined
+  const joined = lines.join('\n')
+  const at = joined.indexOf(old)
+  if (at < 0 || joined.indexOf(old, at + 1) >= 0) return undefined
+  const startLine = countNewlines(joined.slice(0, at)) + 1
+  return { startLine, endLine: startLine + countNewlines(old) }
+}
+
+function countNewlines(text: string): number {
+  return text.split('\n').length - 1
+}
+
+/** Keeps the tracked content current, so the next sub-edit of a `MultiEdit`
+ *  sees the lines the previous one shifted. */
+function applyEdit(state: NormalizerState | undefined, path: string, old: string, next: string): void {
+  const lines = state?.files.get(path)
+  if (state === undefined || lines === undefined) return
+  const joined = lines.join('\n')
+  const at = joined.indexOf(old)
+  if (at < 0) return
+  state.files.set(path, (joined.slice(0, at) + next + joined.slice(at + old.length)).split('\n'))
+}
+
+/**
+ * A `Read` result is `<line number>\t<text>` per line. Absolute numbers, so a
+ * window out of a large file still yields real line numbers once the unread
+ * prefix is padded.
+ */
+function linesFromReadResult(output: string): { first: number; lines: string[] } | undefined {
+  const seen = new Map<number, string>()
+  for (const raw of output.split('\n')) {
+    const match = /^\s*(\d+)\t(.*)$/.exec(raw)
+    if (match === null) continue
+    const number = Number(match[1])
+    if (!Number.isInteger(number) || number < 1) continue
+    seen.set(number, match[2] ?? '')
+  }
+  if (seen.size === 0) return undefined
+  const numbers = [...seen.keys()]
+  const first = Math.min(...numbers)
+  const last = Math.max(...numbers)
+  const lines: string[] = []
+  for (let n = first; n <= last; n += 1) lines.push(seen.get(n) ?? '')
+  return { first, lines }
+}
+
+/**
+ * Merges a `Read` window into what the driver already knows, rather than
+ * replacing it. A windowed read of lines 500-502 must not discard lines 1-499
+ * the driver learned from an earlier read or from `Write` — an `Edit` in that
+ * prefix would then fail to locate and degrade to `tool.other`, losing a
+ * `file.edit` the driver was perfectly able to report.
+ */
+function mergeReadWindow(existing: string[] | undefined, window: { first: number; lines: string[] }): string[] {
+  const merged = existing === undefined ? [] : [...existing]
+  while (merged.length < window.first - 1) merged.push('')
+  for (let offset = 0; offset < window.lines.length; offset += 1) {
+    merged[window.first - 1 + offset] = window.lines[offset] ?? ''
+  }
+  return merged
 }
 
 /**
@@ -339,6 +438,16 @@ function normalizeUser(msg: Rec, state?: NormalizerState): AgentEvent[] {
     const record = id === undefined ? undefined : state?.toolUses.get(id)
     const output = resultText(block['content'])
     const failed = block['is_error'] === true
+    // A `Read` is how the driver learns what a file contains: Claude Code
+    // requires one before it will `Edit`, so this is what makes a pre-edit
+    // `range` computable in practice.
+    if (record?.name === 'Read' && !failed) {
+      const path = str(record.input['file_path'])
+      const window = path === undefined ? undefined : linesFromReadResult(output)
+      if (path !== undefined && window !== undefined && state !== undefined) {
+        state.files.set(path, mergeReadWindow(state.files.get(path), window))
+      }
+    }
     if (record?.name === 'Bash') {
       events.push({ kind: 'command.output', output, stream: failed ? 'stderr' : 'stdout' })
     } else {

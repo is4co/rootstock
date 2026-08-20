@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { getDriver, registerDriver } from '../registry'
 import type { AgentEvent } from '../types'
+import type { NormalizerState } from './claude-code'
 import { createClaudeCodeDriver, createNormalizerState, normalizeSdkMessage } from './claude-code'
 
 const WORKTREE = '/tmp/rootstock-fixture-worktree'
@@ -110,6 +111,24 @@ function toolResult(id: string, content: unknown, isError = false): unknown {
   }
 }
 
+/**
+ * Seeds the normalizer's line index the way a real session does: Claude Code
+ * requires a `Read` before it will `Edit`, and that result carries absolute
+ * line numbers as `<n>\t<text>`. Going through the public normalizer rather
+ * than reaching into the state keeps these tests honest about how the index is
+ * actually populated in a live run.
+ */
+function seededByRead(path: string, content: string): NormalizerState {
+  const state = createNormalizerState(WORKTREE)
+  normalizeSdkMessage(assistantToolUse('seed', 'Read', { file_path: path }), state)
+  const numbered = content
+    .split('\n')
+    .map((line, index) => `${String(index + 1)}\t${line}`)
+    .join('\n')
+  normalizeSdkMessage(toolResult('seed', numbered), state)
+  return state
+}
+
 function result(overrides: Record<string, unknown> = {}): unknown {
   return {
     type: 'result',
@@ -167,42 +186,162 @@ describe('normalizeSdkMessage', () => {
     expect(events).toEqual([{ kind: 'file.create', path: `${WORKTREE}/a.ts`, after: 'export const a = 1\n' }])
   })
 
-  test('Edit becomes file.edit with before and after fragments', () => {
+  test('Edit becomes file.edit carrying the pre-edit span its after replaces', () => {
+    const path = `${WORKTREE}/a.ts`
+    const state = seededByRead(path, 'const a = 1\nconst b = 2\nconst c = 3\n')
     const events = normalizeSdkMessage(
-      assistantToolUse('t2', 'Edit', { file_path: `${WORKTREE}/a.ts`, old_string: 'const a = 1', new_string: 'const a = 2' }),
+      assistantToolUse('t2', 'Edit', { file_path: path, old_string: 'const b = 2', new_string: 'const b = 22' }),
+      state,
     )
     expect(events).toEqual([
-      { kind: 'file.edit', path: `${WORKTREE}/a.ts`, after: 'const a = 2', before: 'const a = 1' },
+      { kind: 'file.edit', path, after: 'const b = 22', before: 'const b = 2', range: { startLine: 2, endLine: 2 } },
     ])
   })
 
-  test('MultiEdit becomes one file.edit per edit', () => {
+  test('a multi-line Edit reports an inclusive pre-edit span', () => {
+    const path = `${WORKTREE}/a.ts`
+    const state = seededByRead(path, 'one\ntwo\nthree\nfour\n')
+    const events = normalizeSdkMessage(
+      assistantToolUse('t2b', 'Edit', { file_path: path, old_string: 'two\nthree', new_string: 'merged' }),
+      state,
+    )
+    expect(events).toEqual([
+      { kind: 'file.edit', path, after: 'merged', before: 'two\nthree', range: { startLine: 2, endLine: 3 } },
+    ])
+  })
+
+  test('an Edit the driver cannot locate degrades to tool.other, never a range-less file.edit', () => {
+    const path = `${WORKTREE}/never-read.ts`
+    const input = { file_path: path, old_string: 'a', new_string: 'b' }
+    const events = normalizeSdkMessage(assistantToolUse('t2c', 'Edit', input), createNormalizerState(WORKTREE))
+    expect(events.filter((event) => event.kind === 'file.edit')).toEqual([])
+    expect(events).toEqual([{ kind: 'tool.other', name: 'Edit', payload: input }])
+  })
+
+  test('an ambiguous Edit span degrades rather than guessing which occurrence moved', () => {
+    const path = `${WORKTREE}/dup.ts`
+    const state = seededByRead(path, 'dup\ndup\n')
+    const events = normalizeSdkMessage(
+      assistantToolUse('t2d', 'Edit', { file_path: path, old_string: 'dup', new_string: 'x' }),
+      state,
+    )
+    expect(events.map((event) => event.kind)).toEqual(['tool.other'])
+  })
+
+  test('Write seeds the index, so a later Edit on that path carries a range', () => {
+    const path = `${WORKTREE}/new.ts`
+    const state = createNormalizerState(WORKTREE)
+    normalizeSdkMessage(assistantToolUse('w1', 'Write', { file_path: path, content: 'x\ny\nz\n' }), state)
+    const events = normalizeSdkMessage(
+      assistantToolUse('w2', 'Edit', { file_path: path, old_string: 'y', new_string: 'yy' }),
+      state,
+    )
+    expect(events).toEqual([
+      { kind: 'file.edit', path, after: 'yy', before: 'y', range: { startLine: 2, endLine: 2 } },
+    ])
+  })
+
+  test('a windowed Read still yields real line numbers', () => {
+    const path = `${WORKTREE}/big.ts`
+    const state = createNormalizerState(WORKTREE)
+    normalizeSdkMessage(assistantToolUse('r1', 'Read', { file_path: path }), state)
+    // The engine showed only lines 500-502 out of a large file.
+    normalizeSdkMessage(toolResult('r1', '   500\tfoo\n   501\tbar\n   502\tbaz'), state)
+    const events = normalizeSdkMessage(
+      assistantToolUse('r2', 'Edit', { file_path: path, old_string: 'bar', new_string: 'BAR' }),
+      state,
+    )
+    expect(events).toEqual([
+      { kind: 'file.edit', path, after: 'BAR', before: 'bar', range: { startLine: 501, endLine: 501 } },
+    ])
+  })
+
+  // Both tests below fail against a driver that replaces the whole index on
+  // every Read — the bug that was actually fixed. The second additionally fails
+  // against a driver that keeps the old content and ignores the window, by
+  // asking for a span that straddles the retained prefix and the updated
+  // window line. A merge that drops either half cannot satisfy it.
+  test('a windowed Read does not discard content the driver already knew', () => {
+    const path = `${WORKTREE}/big.ts`
+    const state = createNormalizerState(WORKTREE)
+    normalizeSdkMessage(assistantToolUse('r1', 'Read', { file_path: path }), state)
+    normalizeSdkMessage(toolResult('r1', '1\tone\n2\ttwo\n3\tthree'), state)
+    // A second, windowed read showing only line 3 must not forget lines 1-2.
+    normalizeSdkMessage(assistantToolUse('r2', 'Read', { file_path: path }), state)
+    normalizeSdkMessage(toolResult('r2', '   3\tthree-changed'), state)
+
+    const events = normalizeSdkMessage(
+      assistantToolUse('r3', 'Edit', { file_path: path, old_string: 'one', new_string: 'ONE' }),
+      state,
+    )
+    expect(events).toEqual([
+      { kind: 'file.edit', path, after: 'ONE', before: 'one', range: { startLine: 1, endLine: 1 } },
+    ])
+  })
+
+  test('a windowed Read updates the lines it shows without forgetting the ones it does not', () => {
+    const path = `${WORKTREE}/big.ts`
+    const state = createNormalizerState(WORKTREE)
+    normalizeSdkMessage(assistantToolUse('r1', 'Read', { file_path: path }), state)
+    normalizeSdkMessage(toolResult('r1', '1\tone\n2\ttwo\n3\tthree'), state)
+    // A window showing only line 3, changed since the full read.
+    normalizeSdkMessage(assistantToolUse('r2', 'Read', { file_path: path }), state)
+    normalizeSdkMessage(toolResult('r2', '   3\tthree-changed'), state)
+
+    // The span straddles the retained prefix (line 2, known only from the first
+    // read) and the updated window line (line 3, known only from the second).
+    // Replacing the index loses `two`; ignoring the window loses
+    // `three-changed`. Only a real merge can locate this.
+    const events = normalizeSdkMessage(
+      assistantToolUse('r3', 'Edit', {
+        file_path: path,
+        old_string: 'two\nthree-changed',
+        new_string: 'merged',
+      }),
+      state,
+    )
+    expect(events).toEqual([
+      {
+        kind: 'file.edit',
+        path,
+        after: 'merged',
+        before: 'two\nthree-changed',
+        range: { startLine: 2, endLine: 3 },
+      },
+    ])
+  })
+
+  test('MultiEdit ranges account for the shift each earlier sub-edit causes', () => {
+    const path = `${WORKTREE}/a.ts`
+    // The first sub-edit turns one line into three, so the second sub-edit's
+    // line moves from 3 to 5. A range ignoring the shift would still say 3.
+    const state = seededByRead(path, 'alpha\nbeta\ngamma\n')
     const events = normalizeSdkMessage(
       assistantToolUse('t3', 'MultiEdit', {
-        file_path: `${WORKTREE}/a.ts`,
+        file_path: path,
         edits: [
-          { old_string: 'one', new_string: 'uno' },
-          { old_string: 'two', new_string: 'dos' },
+          { old_string: 'alpha', new_string: 'alpha\nalpha2\nalpha3' },
+          { old_string: 'gamma', new_string: 'gamma-edited' },
         ],
       }),
+      state,
     )
     expect(events).toEqual([
-      { kind: 'file.edit', path: `${WORKTREE}/a.ts`, after: 'uno', before: 'one' },
-      { kind: 'file.edit', path: `${WORKTREE}/a.ts`, after: 'dos', before: 'two' },
+      {
+        kind: 'file.edit',
+        path,
+        after: 'alpha\nalpha2\nalpha3',
+        before: 'alpha',
+        range: { startLine: 1, endLine: 1 },
+      },
+      { kind: 'file.edit', path, after: 'gamma-edited', before: 'gamma', range: { startLine: 5, endLine: 5 } },
     ])
   })
 
-  test('NotebookEdit becomes file.edit against the notebook path', () => {
-    const events = normalizeSdkMessage(
-      assistantToolUse('t4', 'NotebookEdit', {
-        notebook_path: `${WORKTREE}/n.ipynb`,
-        old_source: 'print(1)',
-        new_source: 'print(2)',
-      }),
-    )
-    expect(events).toEqual([
-      { kind: 'file.edit', path: `${WORKTREE}/n.ipynb`, after: 'print(2)', before: 'print(1)' },
-    ])
+  test('NotebookEdit degrades to tool.other — one cell of a JSON notebook has no line span', () => {
+    const input = { notebook_path: `${WORKTREE}/n.ipynb`, old_source: 'print(1)', new_source: 'print(2)' }
+    const events = normalizeSdkMessage(assistantToolUse('t4', 'NotebookEdit', input))
+    expect(events).toEqual([{ kind: 'tool.other', name: 'NotebookEdit', payload: input }])
   })
 
   test('Bash becomes command.run', () => {

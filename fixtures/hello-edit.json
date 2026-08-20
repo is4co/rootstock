@@ -11,8 +11,8 @@
           "event": {
             "kind": "file.edit",
             "path": "web/pages/home.tsx",
-            "before": "export default function Home() {\n  return <h1>Welcome</h1>\n}\n",
-            "after": "export default function Home() {\n  return <h1>Hello</h1>\n}\n",
+            "before": "  return <h1>Welcome</h1>",
+            "after": "  return <h1>Hello</h1>",
             "range": { "startLine": 2, "endLine": 2 }
           }
         },

@@ -72,6 +72,14 @@ The capability declaration is exactly nine flags:
 Both counts are held in place by a type-level exhaustiveness assertion in `src/types.test.ts`,
 so adding an eleventh kind or a tenth flag fails the typecheck rather than drifting quietly.
 
+`file.edit` carries `after` and an optional `range`, and the two are read together. `range`
+locates `after` in the file as it was **before** the edit: `startLine`/`endLine` are 1-based
+with both endpoints inclusive, so a consumer holding the pre-edit content applies the edit as
+`lines.splice(startLine - 1, endLine - startLine + 1, ...after.split('\n'))`. A `range` present
+means `after` is that span alone; a `range` absent means `after` is the whole file. A driver
+that knows the span but cannot number it must emit `tool.other` instead — a range-less
+`file.edit` reads as "replace the file with this fragment", which silently truncates it.
+
 ## Capability degradation
 
 A `false` flag is not a hole. It is a promise about what happens instead, and the conformance
@@ -164,32 +172,59 @@ that develops the conformance suite itself. Token-free, network-free, no licensi
 
 ## What is exercised, and what is not
 
-Everything in v0.1.0 is proven **offline only**. The test suite runs in-process against fixtures
-and fakes, with no network and no key: 91 passing tests across 7 files, plus 3 tests skipped for
-want of a key.
+Two layers, and the difference matters. Offline, `bun test` runs in-process against fixtures and
+fakes with no network and no key: 99 passing tests across 7 files, plus 4 skipped for want of a
+key. Separately, on **2026-08-20**, the `claude-code` driver was run against the real engine.
 
 - **Exercised offline:** the event normalizer (`normalizeSdkMessage` is pure and graded directly
-  on SDK-shaped inputs), the registry and its budget seam, both budget caps and their fallbacks,
-  the full conformance suite against the `scripted` driver on both branches of all nine flags.
-- **Never run against a real engine:** the `claude-code` driver's session. Its resume, interject,
-  interrupt and live cost metering are implemented and unit-tested, but no API key has been
-  reachable at any point in this repo's history — zero live tokens, zero dollars spent. Reading
-  the green suite as a green driver would be a mistake. The live pass is
-  `src/drivers/claude-code.live.test.ts`, which skips itself without `ANTHROPIC_API_KEY`; running
-  it once against a real key is what would make the driver's declarations true rather than merely
-  stated.
+  on SDK-shaped inputs, including the pre-edit `range` it computes for every `Edit`), the
+  registry and its budget seam, both budget caps and their fallbacks, the full conformance suite
+  against the `scripted` driver on both branches of all nine flags.
+- **Exercised against the real engine** (`src/drivers/claude-code.live.test.ts`, run twice, clean
+  both times): all eighteen conformance checks, which covers every one of the nine declared
+  capabilities — `streamingText`, `fileEvents`, `resume`, `interrupt`, `interject`, `hooks`,
+  `toolInjection`, `costReporting` and `modelSelection`. Plus, as their own live tests, resume
+  continuity across a closed session, an interrupt mid-turn leaving the session idle and the
+  stream clean, and a real edit carrying a `range` that locates its own `before` text in the
+  pre-edit file.
+- **Still offline-only:** everything outside the `claude-code` driver — the registry, the budget
+  layer and the `scripted` driver are fixture-graded by design and have no live surface.
 
-Two known gaps, recorded rather than papered over:
+The live pass skips itself without `ANTHROPIC_API_KEY`, so `bun test` stays key-free and
+network-free. A skipped live run is an unverified driver, not a passing one; read the two layers
+separately.
+
+Four known gaps, recorded rather than papered over:
 
 1. **`cap.interject`'s true branch has no depth assertion.** The suite grades it on two things:
    that `interject()` resolved, and that the turn ended afterwards. Neither distinguishes a note
-   actually delivered mid-turn from one silently dropped. The assertion that would close it needs
-   a live key — interject a token mid-turn and assert the same turn's `message.delta` echoes it
-   before `turn.end`.
+   actually delivered mid-turn from one silently dropped. This is **not closed**, and it is a
+   deliberate limit rather than an oversight: the conformance spec defines the true branch as
+   liveness only, because engines differ on whether mid-turn delivery is observable at all.
+   Closing it means interjecting a token mid-turn and asserting the same turn's `message.delta`
+   echoes it before `turn.end` — which would also require the `scripted` driver to grow
+   interject-aware fixture steps, and could end with `claude-code` declaring `interject: false`.
+   A live key is reachable now, so the key is no longer what blocks it; the decision is.
 2. **The test suite has latent order-dependence on the registry.** `registerDriver` keeps a
    process-global map and refuses a duplicate id, so a future test file registering under an id
    another file already claimed will fail depending on file order. Register under a distinct id
    per test file until the registry grows a test-scoped reset.
+3. **Ranging an edit depends on the engine reading before it writes.** The driver can only
+   locate an `Edit`'s span in content it has already seen, which it learns from `Write` content
+   and `Read` results. Claude Code requires a `Read` before an `Edit`, so this holds today and
+   is exercised live. If a future engine or permission mode let an `Edit` through without one,
+   that edit would degrade to `tool.other` and `cap.fileEvents` would fail — a working driver
+   failing on an engine-side convention. It fails safe rather than reporting a wrong range.
+   The same applies in one more direction: a `Read` window merges into what the driver already
+   knows rather than replacing it, so if a file shrinks outside the driver's view, lines past
+   the new end-of-file linger in the index. A duplicate match then trips the uniqueness guard
+   and yields `tool.other` where a fresh index would have produced a correct range. Both
+   directions trade a lost `file.edit` for never emitting a wrong span.
+4. **`NotebookEdit` degrades to `tool.other`.** Its `new_source` is one cell of a JSON notebook,
+   so neither a whole-file `after` nor a line range is meaningful for it. Rather than emit a
+   `file.edit` whose fragment a consumer would splice over the whole file, the driver carries it
+   opaquely. A consumer that wants notebook edits rendered needs a notebook-shaped event, which
+   the union does not have.
 
 ## Versioning
 

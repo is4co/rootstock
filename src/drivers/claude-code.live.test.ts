@@ -16,7 +16,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { runConformance } from '../conformance'
+import { CONFORMANCE_EDIT_CONTENT, CONFORMANCE_EDIT_FILE, CONFORMANCE_TASKS, runConformance } from '../conformance'
 import type { AgentEvent, Session } from '../types'
 import { createClaudeCodeDriver } from './claude-code'
 
@@ -95,6 +95,10 @@ function turnEnds(events: AgentEvent[]): Extract<AgentEvent, { kind: 'turn.end' 
   return events.filter((event): event is Extract<AgentEvent, { kind: 'turn.end' }> => event.kind === 'turn.end')
 }
 
+function fileEdits(events: AgentEvent[]): Extract<AgentEvent, { kind: 'file.edit' }>[] {
+  return events.filter((event): event is Extract<AgentEvent, { kind: 'file.edit' }> => event.kind === 'file.edit')
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -134,6 +138,39 @@ describe.skipIf(!HAS_KEY)('claude-code live session lifecycle', () => {
       expect(await waitFor(() => turnEnds(fromResumed).length >= 1, TURN_TIMEOUT_MS)).toBe(true)
       expect(textOf(fromResumed).toLowerCase()).toContain('mulberry-73')
       await resumed.close()
+    },
+    600_000,
+  )
+
+  test(
+    'a real edit carries a range that locates its own before-text in the pre-edit file',
+    async () => {
+      const driver = createClaudeCodeDriver()
+      const worktree = await makeWorkspace()
+      await writeFile(join(worktree, CONFORMANCE_EDIT_FILE), CONFORMANCE_EDIT_CONTENT)
+      const session = await driver.start({ worktree, tier: 'fast' })
+      const seen = collect(session)
+
+      await session.send(CONFORMANCE_TASKS.fileChange)
+      expect(await waitFor(() => turnEnds(seen).length >= 1, TURN_TIMEOUT_MS)).toBe(true)
+
+      const edit = fileEdits(seen).find((event) => event.path.endsWith(CONFORMANCE_EDIT_FILE))
+      if (edit === undefined) throw new Error(`no file.edit for ${CONFORMANCE_EDIT_FILE}: ${JSON.stringify(seen)}`)
+
+      // The contract, graded against the engine rather than a fixture: `range`
+      // is present, it indexes the file as it was BEFORE the edit, it is
+      // 1-based and inclusive, and `after` is only that span. Asserting that
+      // the span reproduces `before` keeps this true however much surrounding
+      // context the model chose to quote.
+      const range = edit.range
+      if (range === undefined) throw new Error(`file.edit carried no range: ${JSON.stringify(edit)}`)
+      // A ranged edit that omits `before` would leave the span unverifiable.
+      if (edit.before === undefined) throw new Error(`ranged file.edit carried no before: ${JSON.stringify(edit)}`)
+      const preEdit = CONFORMANCE_EDIT_CONTENT.split('\n')
+      expect(preEdit.slice(range.startLine - 1, range.endLine).join('\n')).toBe(edit.before)
+      expect(edit.after).not.toBe(CONFORMANCE_EDIT_CONTENT)
+
+      await session.close()
     },
     600_000,
   )
