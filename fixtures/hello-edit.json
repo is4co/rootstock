@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "turns": [
+    {
+      "match": "hello",
+      "steps": [
+        { "event": { "kind": "status", "status": "working" } },
+        { "event": { "kind": "message.delta", "text": "Sure — " } },
+        { "event": { "kind": "message.delta", "text": "changing the heading now." } },
+        {
+          "event": {
+            "kind": "file.edit",
+            "path": "web/pages/home.tsx",
+            "before": "export default function Home() {\n  return <h1>Welcome</h1>\n}\n",
+            "after": "export default function Home() {\n  return <h1>Hello</h1>\n}\n",
+            "range": { "startLine": 2, "endLine": 2 }
+          }
+        },
+        {
+          "event": {
+            "kind": "turn.end",
+            "stopReason": "completed",
+            "usage": {
+              "inputTokens": 100,
+              "outputTokens": 50,
+              "costUsd": 0.01,
+              "wallClockMs": 1200,
+              "turns": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "steps": [
+        { "event": { "kind": "message.delta", "text": "Done — anything else?" } },
+        {
+          "event": {
+            "kind": "turn.end",
+            "stopReason": "completed",
+            "usage": {
+              "inputTokens": 100,
+              "outputTokens": 50,
+              "costUsd": 0.01,
+              "wallClockMs": 400,
+              "turns": 1
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
