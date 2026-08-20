@@ -32,7 +32,6 @@ import type {
   TurnOptions,
   TurnUsage,
 } from '../types'
-import { UnsupportedError } from '../types'
 
 // ---------------------------------------------------------------------------
 // Tier → model. The whole point of this mapping living in a driver is that a
@@ -70,22 +69,34 @@ const TIERS: ModelTier[] = [
 const DEFAULT_TIER: ModelTier['tier'] = 'fast'
 
 /**
- * What this step ships. `resume`, `interrupt` and `interject` are step 08's
- * work: their `Session` methods exist because the interface requires them, and
- * each performs the degradation its doc comment in src/types.ts promises rather
- * than pretending to work. Step 08 flips the three flags as it implements them.
+ * All nine, matching §2.5.4. `resume`, `interrupt` and `interject` are real
+ * here: resume re-opens the engine's own session by its `session_id`, interrupt
+ * calls the query object's `interrupt()`, and interject feeds a note into the
+ * live streaming input rather than buffering it for the next turn.
+ *
+ * Flipping `interject` is also what makes `hooks: true` honest — the flag
+ * promises hook feedback "reaches the agent mid-turn", and until interject
+ * existed that feedback could only ride out as the next turn's preamble.
  */
 const CAPABILITIES: DriverCapabilities = {
   streamingText: true,
   fileEvents: true,
-  resume: false,
-  interrupt: false,
-  interject: false,
+  resume: true,
+  interrupt: true,
+  interject: true,
   hooks: true,
   toolInjection: true,
   costReporting: true,
   modelSelection: true,
 }
+
+/**
+ * How long an interrupted turn is given to produce its own `result` before the
+ * driver synthesizes a `turn.end` for it. An interrupt that the engine never
+ * acknowledges must not lose the turn — metering and the caller's queue both
+ * hang off `turn.end`.
+ */
+const INTERRUPT_GRACE_MS = 5_000
 
 /** The MCP server injected tools are mounted on. The engine exposes them to the
  *  model as `mcp__<server>__<tool>`; the normalizer strips that prefix back off
@@ -530,13 +541,22 @@ interface PendingTurn {
 type QueryHandle = ReturnType<typeof query>
 
 class ClaudeCodeSession implements Session {
-  readonly id: SessionId = nextSessionId()
+  /**
+   * The engine's own `session_id`, as soon as the engine reports one — which is
+   * what `Driver.resume()` takes back, and what makes resume survive a process
+   * restart. Until the first message arrives it is a local placeholder, because
+   * the interface requires a non-empty id before any turn is taken; a resumed
+   * session starts out carrying the id it was asked to resume.
+   */
+  id: SessionId
 
   events: AsyncIterable<AgentEvent>
 
   private readonly stream = new EventStream()
   private readonly pending: PendingTurn[] = []
   private readonly preamble: string[] = []
+  /** Notes to feed into the turn that is open right now (see interject). */
+  private readonly interjections: string[] = []
   private readonly normalizer: NormalizerState
   private readonly hooks: SessionHooks | undefined
   private readonly tier: ModelTier['tier']
@@ -548,6 +568,13 @@ class ClaudeCodeSession implements Session {
   private turnOpen = false
   private closed = false
 
+  // Interrupt bookkeeping.
+  private interruptRequested = false
+  /** After an interrupted turn.end, the engine's stragglers are dropped so
+   *  nothing follows it — the contract `interrupt: true` promises. */
+  private swallowing = false
+  private interruptTimer: ReturnType<typeof setTimeout> | null = null
+
   // Running totals. `costReporting: true`, so none of these is ever null.
   private turns = 0
   private inputTokens = 0
@@ -555,10 +582,20 @@ class ClaudeCodeSession implements Session {
   private costUsd = 0
   private wallClockMs = 0
 
+  // Live, mid-turn metering: what the open turn has spent so far, folded into
+  // the running totals when its `result` lands so nothing is counted twice.
+  private liveInputTokens = 0
+  private liveOutputTokens = 0
+  private turnStartedAtMs = 0
+  private readonly meteredMessageIds = new Set<string>()
+
   constructor(
     private readonly options: SessionOptions,
     private readonly configDir: string | undefined,
+    /** Set only by `Driver.resume()`: the engine session to re-open. */
+    private readonly resumeFrom?: SessionId,
   ) {
+    this.id = resumeFrom ?? nextSessionId()
     this.tier = options.tier ?? DEFAULT_TIER
     this.activeTier = this.tier
     this.hooks = options.hooks
@@ -570,8 +607,11 @@ class ClaudeCodeSession implements Session {
 
   send(text: string, opts?: TurnOptions): Promise<void> {
     if (this.closed) return Promise.reject(new Error(`session is closed: ${this.id}`))
-    // Buffered notes and hook feedback ride out as the next turn's preamble —
-    // the declared degradation for `interject: false` (§2.5.3).
+    // A new owner turn ends the quiet period after an interrupt.
+    this.swallowing = false
+    this.interruptRequested = false
+    // Notes taken while no turn was open have nowhere mid-turn to go, so they
+    // ride out as this turn's preamble instead.
     const notes = this.preamble.splice(0, this.preamble.length)
     this.pending.push({
       text: notes.length === 0 ? text : [...notes, text].join('\n\n'),
@@ -590,32 +630,66 @@ class ClaudeCodeSession implements Session {
   }
 
   /**
-   * `interject: false`. The note is buffered and prepended to the next send's
-   * text — "the next turn's preamble" (§2.5.3). Step 08 delivers it into the
-   * in-flight turn and flips the flag.
+   * `interject: true`. The note is queued into the live streaming input — the
+   * same queue `send()` uses — and delivered into the turn that is already
+   * running, without waiting for it to end and without counting as an owner
+   * turn: `turns` only ever moves on a `turn.end`.
+   *
+   * With no turn in flight there is nothing to interject *into*, so the note
+   * falls back to the next turn's preamble. That is the same route the
+   * `interject: false` degradation takes, used here for the one case the
+   * capability cannot cover rather than as a substitute for it.
    */
   interject(note: string): Promise<void> {
-    if (note.length > 0) this.preamble.push(note)
+    if (note.length === 0) return Promise.resolve()
+    if (this.turnOpen && this.handle !== null && !this.interruptRequested) {
+      this.interjections.push(note)
+      this.wakeInput()
+    } else {
+      this.preamble.push(note)
+    }
     return Promise.resolve()
   }
 
   /**
-   * `interrupt: false`. Resolves, the in-flight turn runs to its natural end,
-   * and turns queued behind it are discarded. Step 08 calls the engine's own
-   * `interrupt()` and flips the flag.
+   * `interrupt: true`. Cancels the in-flight turn through the engine's own
+   * control channel, drops everything queued behind it, and leaves the session
+   * `idle` and reusable. The turn closes with `turn.end` / `interrupted` — from
+   * the engine's `result` if it sends one, synthesized if it does not — and
+   * nothing follows it.
    */
-  interrupt(): Promise<void> {
+  async interrupt(): Promise<void> {
     this.pending.length = 0
-    return Promise.resolve()
+    this.interjections.length = 0
+    const handle = this.handle
+    if (this.closed || handle === null || !this.turnOpen) return
+    this.interruptRequested = true
+    try {
+      await handle.interrupt()
+    } catch {
+      // An engine that refuses the cancel must not leave interrupt() rejecting.
+      // The fallback below is what still closes the turn.
+    }
+    if (this.closed) return
+    this.setStatus('idle')
+    this.armInterruptFallback()
   }
 
+  /**
+   * Live: answers during a turn, not only between turns. The open turn's tokens
+   * come from the engine's `assistant` messages (deduplicated by message id)
+   * and its wall clock from this process; its cost stays at the last figure the
+   * engine reconciled, because `total_cost_usd` is only quoted on a `result`
+   * and rootstock does not price tokens itself.
+   */
   usage(): TurnUsage {
+    const openMs = this.turnOpen && this.turnStartedAtMs > 0 ? Date.now() - this.turnStartedAtMs : 0
     return {
-      inputTokens: this.inputTokens,
-      outputTokens: this.outputTokens,
+      inputTokens: this.inputTokens + this.liveInputTokens,
+      outputTokens: this.outputTokens + this.liveOutputTokens,
       costUsd: this.costUsd,
-      wallClockMs: this.wallClockMs,
-      turns: this.turns,
+      wallClockMs: this.wallClockMs + openMs,
+      turns: this.turns + (this.turnOpen ? 1 : 0),
     }
   }
 
@@ -623,6 +697,8 @@ class ClaudeCodeSession implements Session {
     if (this.closed) return
     this.closed = true
     this.pending.length = 0
+    this.interjections.length = 0
+    this.clearInterruptFallback()
     this.setStatus('dead')
     this.stream.close()
     // Let the input generator return, which is how the engine learns the
@@ -652,10 +728,11 @@ class ClaudeCodeSession implements Session {
 
   /**
    * Streaming input mode — the stable long-lived multi-turn shape, and the only
-   * mode where the engine's controls work. Nothing is yielded while a turn is
-   * open, so one send is exactly one turn: that is what makes discarding a
-   * queued turn (the `interrupt: false` degradation) meaningful rather than a
-   * race against the engine's own batching.
+   * mode where the engine's controls work. Owner turns are yielded one at a
+   * time and only while no turn is open, so one send is exactly one turn.
+   * Interjections are the deliberate exception: they are yielded *into* an open
+   * turn, which is the whole of what `interject: true` buys, and they never
+   * open a turn of their own.
    */
   private async *inputs(): AsyncGenerator<{
     type: 'user'
@@ -663,27 +740,39 @@ class ClaudeCodeSession implements Session {
     parent_tool_use_id: null
   }> {
     for (;;) {
-      const turn = await this.nextTurn()
-      if (turn === null) return
-      if (turn.tier !== this.activeTier) {
-        this.activeTier = turn.tier
-        try {
-          await this.handle?.setModel(TIER_MODELS[turn.tier])
-        } catch {
-          // A tier is honored or ignored, never an error (§2.5.3).
+      const next = await this.nextInput()
+      if (next === null) return
+      if (next.owner) {
+        if (next.tier !== this.activeTier) {
+          this.activeTier = next.tier
+          try {
+            await this.handle?.setModel(TIER_MODELS[next.tier])
+          } catch {
+            // A tier is honored or ignored, never an error (§2.5.3).
+          }
         }
+        this.turnOpen = true
+        this.turnStartedAtMs = Date.now()
       }
-      this.turnOpen = true
-      yield { type: 'user', message: { role: 'user', content: turn.text }, parent_tool_use_id: null }
+      yield { type: 'user', message: { role: 'user', content: next.text }, parent_tool_use_id: null }
     }
   }
 
-  private async nextTurn(): Promise<PendingTurn | null> {
+  private async nextInput(): Promise<(PendingTurn & { owner: boolean }) | null> {
     for (;;) {
       if (this.closed) return null
-      if (!this.turnOpen) {
+      if (this.turnOpen) {
+        const note = this.interjections.shift()
+        if (note !== undefined) return { text: note, tier: this.activeTier, owner: false }
+      } else {
+        // The turn a note was meant for ended before the engine came back for
+        // input. It becomes the next turn's preamble rather than a stray turn
+        // of its own.
+        if (this.interjections.length > 0) {
+          this.preamble.push(...this.interjections.splice(0, this.interjections.length))
+        }
         const next = this.pending.shift()
-        if (next !== undefined) return next
+        if (next !== undefined) return { ...next, owner: true }
       }
       await new Promise<void>((resolve) => {
         this.inputWaiter = resolve
@@ -714,6 +803,7 @@ class ClaudeCodeSession implements Session {
   /** Ends the session's stream, leaving `turn.end` last if a turn was open. */
   private die(): void {
     this.state = 'dead'
+    this.clearInterruptFallback()
     this.emit({ kind: 'status', status: 'dead' })
     if (this.turnOpen) {
       this.turnOpen = false
@@ -729,7 +819,17 @@ class ClaudeCodeSession implements Session {
 
   private receive(message: unknown): void {
     if (this.closed) return
+    this.adoptSessionId(message)
+    this.meterLive(message)
     for (const event of normalizeSdkMessage(message, this.normalizer)) {
+      // Everything the engine still has to say about a turn that was
+      // interrupted: its spend is kept, its events are not, because
+      // `interrupt: true` promises nothing follows the interrupted turn.end.
+      if (this.swallowing) {
+        if (event.kind === 'turn.end') this.absorbSpend(event.usage)
+        continue
+      }
+
       // Nothing is emitted outside a turn. The engine may still send
       // informational messages after a result, and the contract for a driver
       // declaring `interrupt: false` is that nothing follows the turn it let
@@ -743,13 +843,14 @@ class ClaudeCodeSession implements Session {
         continue
       }
 
+      if (event.kind === 'error' && this.interruptRequested && event.source === 'agent') {
+        // An interrupted turn usually comes back as an execution error. The
+        // owner asked for the stop; it is not a failure to report to them.
+        continue
+      }
+
       if (event.kind === 'turn.end') {
-        this.accumulate(event.usage)
-        this.turnOpen = false
-        // Emitted before turn.end so that turn.end stays the turn's last event.
-        this.setStatus(this.pending.length > 0 ? 'working' : 'idle')
-        this.emit(event)
-        this.wakeInput()
+        this.closeTurn(event.usage, this.interruptRequested ? 'interrupted' : event.stopReason)
         continue
       }
 
@@ -757,12 +858,105 @@ class ClaudeCodeSession implements Session {
     }
   }
 
+  /**
+   * The engine names its own session, and that name is what `resume()` takes
+   * back — a locally minted id would not survive the process that minted it.
+   * Every message carries it; the `result` is simply the last word.
+   */
+  private adoptSessionId(message: unknown): void {
+    const reported = str(asRecord(message)?.['session_id'])
+    if (reported !== undefined && reported.length > 0) this.id = reported
+  }
+
+  /**
+   * Mid-turn token metering, deduplicated by `message.id`: while a response
+   * streams, the engine emits one `assistant` message per content block and
+   * several consecutive blocks share an id, so counting every message would
+   * multiply the turn's tokens by its block count. Cost is not read here —
+   * `usage` on an assistant message carries tokens only, and the authoritative
+   * dollars arrive with the turn's `result`.
+   */
+  private meterLive(message: unknown): void {
+    const msg = asRecord(message)
+    if (msg === undefined || str(msg['type']) !== 'assistant') return
+    const inner = asRecord(msg['message'])
+    const id = str(inner?.['id'])
+    if (id === undefined || this.meteredMessageIds.has(id)) return
+    this.meteredMessageIds.add(id)
+    const usage = asRecord(inner?.['usage'])
+    this.liveInputTokens +=
+      (num(usage?.['input_tokens']) ?? 0) +
+      (num(usage?.['cache_creation_input_tokens']) ?? 0) +
+      (num(usage?.['cache_read_input_tokens']) ?? 0)
+    this.liveOutputTokens += num(usage?.['output_tokens']) ?? 0
+  }
+
+  /**
+   * The one path that ends a turn, whether the engine's `result` ended it or an
+   * unacknowledged interrupt did. Provisional mid-turn counts are dropped in
+   * favour of the engine's own figures for the turn, so nothing is counted
+   * twice.
+   */
+  private closeTurn(usage: TurnUsage, stopReason: StopReason): void {
+    this.clearInterruptFallback()
+    this.accumulate(usage)
+    this.turnOpen = false
+    this.liveInputTokens = 0
+    this.liveOutputTokens = 0
+    this.meteredMessageIds.clear()
+    // Emitted before turn.end so that turn.end stays the turn's last event.
+    this.setStatus(this.pending.length > 0 ? 'working' : 'idle')
+    this.emit({ kind: 'turn.end', stopReason, usage })
+    if (this.interruptRequested) {
+      this.interruptRequested = false
+      this.swallowing = true
+    }
+    this.wakeInput()
+  }
+
+  private armInterruptFallback(): void {
+    if (this.interruptTimer !== null) return
+    const timer = setTimeout(() => {
+      this.interruptTimer = null
+      if (this.closed || !this.turnOpen) return
+      // The engine never acknowledged the cancel. Close the turn ourselves so
+      // metering never loses one; 'interrupted' is a StopReason the contract
+      // already names.
+      this.closeTurn(
+        {
+          inputTokens: this.liveInputTokens,
+          outputTokens: this.liveOutputTokens,
+          costUsd: 0,
+          wallClockMs: this.turnStartedAtMs > 0 ? Date.now() - this.turnStartedAtMs : 0,
+          turns: 1,
+        },
+        'interrupted',
+      )
+    }, INTERRUPT_GRACE_MS)
+    timer.unref?.()
+    this.interruptTimer = timer
+  }
+
+  private clearInterruptFallback(): void {
+    if (this.interruptTimer === null) return
+    clearTimeout(this.interruptTimer)
+    this.interruptTimer = null
+  }
+
   private accumulate(usage: TurnUsage): void {
     this.turns += usage.turns
+    this.absorbSpend(usage)
+  }
+
+  /** Spend without a turn count — what a straggler result contributes. The
+   *  wall clock takes the longer of the engine's figure and what this process
+   *  observed, so a live `usage()` never appears to go backwards. */
+  private absorbSpend(usage: TurnUsage): void {
     this.inputTokens += usage.inputTokens ?? 0
     this.outputTokens += usage.outputTokens ?? 0
     this.costUsd += usage.costUsd ?? 0
-    this.wallClockMs += usage.wallClockMs
+    const observed = this.turnOpen && this.turnStartedAtMs > 0 ? Date.now() - this.turnStartedAtMs : 0
+    this.wallClockMs += Math.max(usage.wallClockMs, observed)
   }
 
   private setStatus(next: SessionStatus): void {
@@ -788,24 +982,28 @@ class ClaudeCodeSession implements Session {
   }
 
   /**
-   * Hook feedback. With `interject: false` it cannot reach the agent mid-turn,
-   * so it takes the same route a buffered note does — the next turn's preamble,
-   * which is exactly the fallback §2.5.3 names. Step 08 makes it mid-turn.
+   * Hook feedback takes the interject path, which is what makes `hooks: true`
+   * mean what src/types.ts says it means — feedback a hook returns reaches the
+   * agent mid-turn. Between turns there is nothing to reach, and interject
+   * buffers it for the next one.
    */
   private absorb(returned: void | { feedback: string }): void {
     if (returned === undefined || returned === null) return
     const feedback = str((returned as Rec)['feedback'])
-    if (feedback !== undefined && feedback.length > 0) this.preamble.push(feedback)
+    if (feedback !== undefined && feedback.length > 0) void this.interject(feedback)
   }
 
   /**
-   * Re-built in full for every `query()` call: MCP config and settings are not
-   * restored on resume, so nothing may be assumed to have persisted (§2.5.4).
+   * Re-built in full for every `query()` call: MCP config, settings flags and
+   * extra-directory grants are not restored on resume, so nothing may be
+   * assumed to have persisted (§2.5.4). Resume is therefore exactly "the same
+   * options, plus `resume`".
    */
   private buildOptions(): Options {
     const tools = this.options.tools ?? []
     return {
       cwd: this.options.worktree,
+      ...(this.resumeFrom === undefined ? {} : { resume: this.resumeFrom }),
       model: TIER_MODELS[this.tier],
       // The permissive session class is a decision (§2.5.5, §9): protection is
       // trellis's lint layer plus the deploy gate, not a permission prompt.
@@ -846,9 +1044,14 @@ export function createClaudeCodeDriver(opts: ClaudeCodeDriverOptions = {}): Driv
     models: () => TIERS.map((tier) => ({ ...tier })),
     start: (sessionOpts: SessionOptions): Promise<Session> =>
       Promise.resolve(new ClaudeCodeSession(sessionOpts, opts.configDir)),
-    // `resume: false` — fails loudly rather than handing back a session with no
-    // memory. Continuity comes from the worktree and git history until step 08
-    // implements resume against the engine's own session ids.
-    resume: (): Promise<Session> => Promise.reject(new UnsupportedError('resume')),
+    /**
+     * `resume: true`. The engine's session JSONL lives under `CLAUDE_CONFIG_DIR`
+     * — the factory's `configDir` — so a session resumes across a process
+     * restart and across the workbench sleeping, which is what makes "one
+     * session per workspace, resumed across days" real (§2.5.4). Like `start`,
+     * this spawns nothing until the first turn.
+     */
+    resume: (sessionId: SessionId, sessionOpts: SessionOptions): Promise<Session> =>
+      Promise.resolve(new ClaudeCodeSession(sessionOpts, opts.configDir, sessionId)),
   }
 }

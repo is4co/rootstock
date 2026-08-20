@@ -3,6 +3,7 @@
 // importable by consumers is re-exported here.
 export * from './types'
 export * from './registry'
+export * from './budget'
 export * from './drivers/scripted'
 export * from './drivers/claude-code'
 export * from './conformance'

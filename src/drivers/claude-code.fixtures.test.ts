@@ -12,7 +12,6 @@ import { describe, expect, test } from 'bun:test'
 
 import { getDriver, registerDriver } from '../registry'
 import type { AgentEvent } from '../types'
-import { UnsupportedError } from '../types'
 import { createClaudeCodeDriver, createNormalizerState, normalizeSdkMessage } from './claude-code'
 
 const WORKTREE = '/tmp/rootstock-fixture-worktree'
@@ -449,17 +448,23 @@ describe('createClaudeCodeDriver', () => {
     const driver = createClaudeCodeDriver()
     expect(driver.id).toBe('claude-code')
     registerDriver(driver)
-    expect(getDriver('claude-code')).toBe(driver)
+    // getDriver() hands back the driver behind the registry's budget guard, so
+    // the identity to assert on is the id and the declarations, not the object.
+    const looked = getDriver('claude-code')
+    expect(looked.id).toBe('claude-code')
+    expect(looked.capabilities).toBe(driver.capabilities)
+    expect(looked.models()).toEqual(driver.models())
+    expect(getDriver('claude-code')).toBe(looked)
     expect(() => { registerDriver(driver) }).toThrow(/driver already registered: claude-code/)
   })
 
-  test('declares exactly what this step ships', () => {
+  test('declares all nine — the full capability set of §2.5.4', () => {
     expect(createClaudeCodeDriver().capabilities).toEqual({
       streamingText: true,
       fileEvents: true,
-      resume: false,
-      interrupt: false,
-      interject: false,
+      resume: true,
+      interrupt: true,
+      interject: true,
       hooks: true,
       toolInjection: true,
       costReporting: true,
@@ -485,16 +490,16 @@ describe('createClaudeCodeDriver', () => {
     expect(driver.models()[0]?.label).toBe(label)
   })
 
-  test('resume rejects with UnsupportedError — it does not throw synchronously', async () => {
+  test('resume hands back the same logical session, and spawns no engine to do it', async () => {
     const driver = createClaudeCodeDriver()
-    // Declared resume: false, so this must fail loudly rather than hand back a
-    // session with no memory. It rejects; it never throws in the caller's frame.
-    const attempt = driver.resume('any-session', { worktree: WORKTREE })
-    expect(attempt).toBeInstanceOf(Promise)
-    await expect(attempt).rejects.toBeInstanceOf(UnsupportedError)
-    await expect(driver.resume('any-session', { worktree: WORKTREE })).rejects.toMatchObject({
-      code: 'ERR_UNSUPPORTED',
-    })
+    // Declared resume: true. The id is the engine's own session id, so a
+    // resumed session must carry it back unchanged — the conformance suite
+    // grades exactly that, and trellis stores it across a workbench sleep.
+    const session = await driver.resume('engine-session-abc', { worktree: WORKTREE })
+    expect(session.id).toBe('engine-session-abc')
+    expect(session.status()).toBe('idle')
+    expect(session.usage().turns).toBe(0)
+    await session.close()
   })
 
   test('a session that never sends starts idle, closes clean, and spawns no engine', async () => {
@@ -532,11 +537,16 @@ describe('createClaudeCodeDriver', () => {
     }
   })
 
-  test('interject and interrupt resolve rather than rejecting, as their false branches promise', async () => {
+  test('interject and interrupt resolve with no turn in flight, and start no engine', async () => {
     const driver = createClaudeCodeDriver()
     const session = await driver.start({ worktree: WORKTREE })
+    // Nothing is running: there is nothing to interject into and nothing to
+    // cancel. Both still resolve, neither spawns a runtime, and neither counts
+    // as a turn — interjection is feedback, never an owner turn.
     await expect(session.interject('a note')).resolves.toBeUndefined()
     await expect(session.interrupt()).resolves.toBeUndefined()
+    expect(session.usage().turns).toBe(0)
+    expect(session.status()).toBe('idle')
     await session.close()
   })
 

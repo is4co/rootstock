@@ -484,9 +484,18 @@ describe('the registry', () => {
     expect(() => getDriver('scripted')).toThrow(/no driver registered as 'scripted'/)
 
     registerDriver(driver)
-    expect(getDriver('scripted')).toBe(driver)
-    expect(getDriver('scripted').id).toBe('scripted')
+    // getDriver() hands back the registered driver behind the budget guard, so
+    // what round-trips is its id, its declarations and its behaviour — not the
+    // object. The guard itself is stable across lookups.
+    const looked = getDriver('scripted')
+    expect(looked.id).toBe('scripted')
+    expect(looked.capabilities).toBe(driver.capabilities)
+    expect(looked.models()).toEqual(driver.models())
+    expect(getDriver('scripted')).toBe(looked)
     expect(() => registerDriver(driver)).toThrow(/driver already registered: scripted/)
-    expect(() => getDriver('nope')).toThrow(/no driver registered as 'nope' \(registered: scripted\)/)
+    // The map is process-global and other test files register into it while
+    // this one runs, so what is asserted is that the message names what IS
+    // registered — not that this file is the only thing in there.
+    expect(() => getDriver('nope')).toThrow(/no driver registered as 'nope' \(registered: .*scripted.*\)/)
   })
 })
