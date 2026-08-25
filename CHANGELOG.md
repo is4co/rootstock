@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.3 — 2026-08-24
+
+**A session can now be told the rules before its first turn.** `SessionOptions` gains an
+optional `briefing`, and the `claude-code` driver passes it to the engine as `systemPrompt`.
+
+Additive only — no exported type changed shape, so this is not a breaking release.
+
+The gap it closes is not a missing convenience. Sessions are built with `settingSources: []`
+by design (§2.5.5): no `CLAUDE.md`, no `.claude/`, no filesystem hooks, no skills. Combined
+with the driver never having set `systemPrompt`, that left **no channel at all** for standing
+context, and a host with a rule to state could only state it after the fact. Trellis enforces a
+diff boundary at its deploy gate; before this field, an agent learned that boundary by having a
+finished, committed edit refused — a rule you only meet by breaking it, which is a trap rather
+than a rule.
+
+Rootstock does not compose the briefing and does not know what is in it. What a boundary is,
+and how to phrase it, belongs to the host. What rootstock guarantees is delivery: `briefing`
+is re-applied on every `query()` call, so it survives a resume exactly as `cwd`, `model` and
+the MCP wiring do.
+
+The value goes over as a **plain string**, not `{ type: 'preset', preset: 'claude_code',
+append }`. The SDK's default when `systemPrompt` is omitted is an empty custom prompt, so a
+string replaces nothing; the preset form would additionally bolt the engine's own Claude Code
+prompt onto every session, which is a much larger change than telling the agent the rules. An
+empty or whitespace-only briefing is treated as absent, so a host with nothing to say gets the
+previous behavior byte for byte. A driver that cannot carry standing context ignores the field
+— the same silent degradation `tools` and `hooks` already declare (§2.5.3), never an error.
+
 ## v0.1.2 — 2026-08-25
 
 **A turn no longer ends while its own work is still running.** The engine's subagent

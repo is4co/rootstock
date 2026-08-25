@@ -195,7 +195,7 @@ export interface SessionBudget {
 }
 
 /** Carries the worktree path, the model tier, the tool policy, the capability
- *  tools to attach, and a budget (§2.5.1). */
+ *  tools to attach, a budget (§2.5.1), and the caller's launch briefing. */
 export interface SessionOptions {
   worktree: string
   tier?: ModelTier['tier']
@@ -203,6 +203,25 @@ export interface SessionOptions {
   tools?: InjectedTool[]
   hooks?: SessionHooks
   budget?: SessionBudget
+  /**
+   * What the agent is told BEFORE its first turn — standing context for the
+   * whole session, not a turn's instruction.
+   *
+   * It exists because a rule an agent only learns by being refused afterwards
+   * is not a rule, it is a trap. A host that enforces something (trellis
+   * enforces a diff boundary at its deploy gate) has to be able to state it at
+   * launch, and until this field there was nowhere to put it: sessions are
+   * built with `settingSources: []` on purpose — no CLAUDE.md, no `.claude/`,
+   * no skills (§2.5.5) — so a file in the worktree is not a channel either.
+   *
+   * Rootstock never composes this. What a boundary is, and how to say it, is
+   * the host's business; rootstock only guarantees it reaches the engine on
+   * every query, including a resume (`buildQueryOptions` is rebuilt per call).
+   *
+   * A driver that cannot carry standing context ignores it — the same silent
+   * degradation as `tools` and `hooks` (§2.5.3), never an error.
+   */
+  briefing?: string
 }
 
 /** Owners choose per session or per turn (§2.5.4). */

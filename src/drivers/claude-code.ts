@@ -1142,6 +1142,7 @@ class ClaudeCodeSession implements Session {
    */
   private buildOptions(): Options {
     const tools = this.options.tools ?? []
+    const briefing = this.options.briefing?.trim()
     return {
       cwd: this.options.worktree,
       ...(this.resumeFrom === undefined ? {} : { resume: this.resumeFrom }),
@@ -1157,6 +1158,20 @@ class ClaudeCodeSession implements Session {
       // running. See `DENIED_TOOLS`.
       settingSources: [],
       disallowedTools: [...DENIED_TOOLS],
+      // The caller's standing context. `settingSources: []` above is exactly why
+      // this field has to exist: with no CLAUDE.md and no `.claude/`, a file in
+      // the worktree is not a channel, so anything the host wants the agent to
+      // know BEFORE its first turn has nowhere else to go.
+      //
+      // A PLAIN STRING, deliberately. The SDK's default when `systemPrompt` is
+      // omitted is an empty custom prompt, so a string replaces nothing and the
+      // change is purely additive; `{ type: 'preset', preset: 'claude_code' }`
+      // would additionally bolt on the engine's own preset, which is a far
+      // bigger change than telling the agent the rules it is working under.
+      //
+      // Empty or whitespace-only is treated as absent rather than sent: a host
+      // that has nothing to say should get today's behavior exactly.
+      ...(briefing === undefined || briefing === '' ? {} : { systemPrompt: briefing }),
       ...(tools.length === 0 ? {} : { mcpServers: { [TOOL_SERVER_NAME]: buildToolServer(tools) } }),
       // Session JSONL lands where the caller says. Rootstock hardcodes no
       // volume path; trellis points this at its workbench volume (§2.2.4).
