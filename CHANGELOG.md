@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.2 — 2026-08-25
+
+**A turn no longer ends while its own work is still running.** The engine's subagent
+dispatcher — `Agent` in the SDK this package pins, `Task` before it — runs in the background
+by default; the SDK's own schema for it says so. A model that dispatches one has nothing
+further to say, so the engine emits `result`, and `result` is what this driver turns into
+`turn.end`. The work then lands seconds after the turn a consumer was told had finished.
+
+That cost was paid on a live box before it was found. Trellis commits and pushes an owner's
+edit on `turn.end` (`is4co/trellis#2`); on 2026-08-25 an owner's first instruction produced
+two background `Agent` calls, a turn that ended in under twenty seconds saying "I'm searching
+for the public home page now. Let me wait for the agent to locate it", a save that ran against
+a still-clean worktree and committed nothing, and the correct edit appearing on disk twenty
+seconds later with nothing left to notice it. The owner saw "Ready" and had no edit.
+
+`buildOptions` now passes `disallowedTools: ['Agent', 'Task']`. This is the same decision as
+`settingSources: []` one line above it: the bare session is declared rather than incidental,
+and background subagents were only ever in it by omission. Denying a name the engine does not
+have costs nothing, which is why both spellings are listed.
+
+`DENIED_TOOLS` is exported so the deny list can be asserted rather than remembered;
+`src/drivers/claude-code.tools.test.ts` pins its contents and, separately, that
+`buildOptions` still hands it to the engine — a constant nothing uses is exactly what this
+regression would look like.
+
+No exported type changed and no capability flag changed. The live conformance suite was re-run
+against the real engine with this in place: 18 checks, all passing.
+
 ## v0.1.1 — 2026-08-20
 
 **Proven against a real engine.** `src/drivers/claude-code.live.test.ts` now runs clean against

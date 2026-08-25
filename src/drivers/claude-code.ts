@@ -105,6 +105,38 @@ const TOOL_SERVER_NAME = 'rootstock'
 
 const TOOL_NAME_PREFIX = `mcp__${TOOL_SERVER_NAME}__`
 
+/**
+ * The engine's subagent dispatcher, denied — because it ends a turn that has not
+ * finished.
+ *
+ * The SDK's own schema for this tool says it plainly: "Agents run in the background
+ * by default; you will be notified when one completes." A model that dispatches one
+ * has nothing left to say, so the engine emits `result`, and `result` is what this
+ * driver turns into `turn.end`. The work then lands seconds *after* the turn a
+ * consumer was told had ended.
+ *
+ * That is not a hypothetical cost. Trellis commits and pushes an owner's edit on
+ * `turn.end` (`is4co/trellis#2`), and on 2026-08-25 an owner's first instruction on
+ * a live workbench produced exactly this: two background `Agent` calls, a turn that
+ * ended in under twenty seconds saying "I'm searching for the public home page now.
+ * Let me wait for the agent to locate it", a save that ran against a clean worktree
+ * and committed nothing, and the correct edit appearing on disk twenty seconds
+ * later with nothing left to notice it. The owner was shown "Ready" and had no
+ * edit; the fix for the SECOND message would have committed it, which is worse than
+ * failing, because the loop looks intermittent rather than broken.
+ *
+ * `turn.end` has to mean the turn is over. A driver cannot make a background agent
+ * synchronous, so the honest move is to not hand the model one. Both spellings are
+ * denied: the tool is `Agent` in the SDK this pins, and was `Task` before it, and a
+ * deny entry for a tool the engine does not have costs nothing.
+ *
+ * This belongs beside `settingSources: []` in spirit — the bare session is
+ * declared, not incidental (§2.5.5). Skills, project settings and hooks were all
+ * excluded deliberately; background subagents are the same class of thing and were
+ * only ever included by omission.
+ */
+export const DENIED_TOOLS: readonly string[] = ['Agent', 'Task']
+
 let sessionCounter = 0
 
 function nextSessionId(): SessionId {
@@ -1120,8 +1152,11 @@ class ClaudeCodeSession implements Session {
       allowDangerouslySkipPermissions: true,
       includePartialMessages: true,
       // Bare sessions, declared rather than incidental: no CLAUDE.md, no
-      // .claude/, no filesystem hooks, no skills (§2.5.5).
+      // .claude/, no filesystem hooks, no skills (§2.5.5) — and no background
+      // subagents, which would let a turn end while its own work was still
+      // running. See `DENIED_TOOLS`.
       settingSources: [],
+      disallowedTools: [...DENIED_TOOLS],
       ...(tools.length === 0 ? {} : { mcpServers: { [TOOL_SERVER_NAME]: buildToolServer(tools) } }),
       // Session JSONL lands where the caller says. Rootstock hardcodes no
       // volume path; trellis points this at its workbench volume (§2.2.4).
