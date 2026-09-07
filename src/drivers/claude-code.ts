@@ -172,6 +172,28 @@ function nextSessionId(): SessionId {
   return `claude-code-${String(Date.now())}-${String(sessionCounter)}`
 }
 
+/**
+ * Is this an id THIS driver minted for itself, rather than one the engine named?
+ *
+ * A session's id starts as a local placeholder because the interface requires a
+ * non-empty id before any turn is taken, and becomes the engine's own the moment
+ * the engine reports one (`adoptSessionId`). A first turn that dies before that
+ * ever happens — a key with no balance, a killed process — leaves the placeholder
+ * as the only id the host has seen, and a host that persists session ids persists
+ * that one. Handed back to `--resume` the CLI refuses it outright, and the turn
+ * dies before it reaches the model: one poisoned id, and every later turn on that
+ * session is dead for good (is4co/trellis#43).
+ *
+ * Only the driver that mints these can recognise one, which is why the guard is
+ * here and not above the driver seam. The pattern is exactly the shape
+ * `nextSessionId` builds and nothing looser: `Date.now()` and the counter are both
+ * positive integers, so both segments are digits, and `claude-code-1-2-3` does not
+ * match. An engine session id is a UUID, so no real session can collide with it.
+ */
+function isPlaceholderSessionId(id: SessionId): boolean {
+  return /^claude-code-\d+-\d+$/.test(id)
+}
+
 // ---------------------------------------------------------------------------
 // Structural readers. The normalizer takes `unknown` rather than an SDK type,
 // which is what keeps SDK shapes out of this module's public signature and lets
@@ -1256,8 +1278,21 @@ export function createClaudeCodeDriver(opts: ClaudeCodeDriverOptions = {}): Driv
      * restart and across the workbench sleeping, which is what makes "one
      * session per workspace, resumed across days" real (§2.5.4). Like `start`,
      * this spawns nothing until the first turn.
+     *
+     * One id is refused: a placeholder this driver minted. It names no engine
+     * session, so `--resume` rejects it on every turn forever, and a host holding
+     * one is stuck rather than merely un-resumed. Rejecting says so in the one
+     * place that can tell, and hands the host back the choice it already knows how
+     * to make — the caller catches a failed resume and starts fresh, losing one
+     * conversation instead of the ability to have another. This is NOT
+     * `UnsupportedError`: that code is the contract's signal for `resume: false`,
+     * and this driver does resume. It refuses one id, not the operation.
      */
     resume: (sessionId: SessionId, sessionOpts: SessionOptions): Promise<Session> =>
-      Promise.resolve(new ClaudeCodeSession(sessionOpts, opts.configDir, sessionId)),
+      isPlaceholderSessionId(sessionId)
+        ? Promise.reject(
+            new Error(`not a resumable session id: ${sessionId} was minted by this driver, not by the engine`),
+          )
+        : Promise.resolve(new ClaudeCodeSession(sessionOpts, opts.configDir, sessionId)),
   }
 }

@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.2.1 — 2026-09-07
+
+**A session id this driver minted for itself is no longer accepted back as one to resume.**
+A `ClaudeCodeSession` starts life carrying `claude-code-<ms>-<n>`, because the interface
+requires a non-empty id before any turn is taken, and swaps it for the engine's own the
+moment the engine reports one. If the first turn dies before that ever happens, the
+placeholder is the only id the host has seen — and a host that persists session ids persists
+that.
+
+The next resume hands it to `--resume`, which answers `"claude-code-1787617156728-1" is not
+a UUID and does not match any session title` and kills the turn before it reaches the model.
+The turn costs exactly zero dollars, which is the tell. It is not a bad run to retry: the
+same id is stored, so the same refusal comes back on every turn after it, forever. Measured
+on three trellis workspaces on 2026-08-25 (`is4co/trellis#43`); the one that started it hit
+an Anthropic key with no balance on its very first turn.
+
+`createClaudeCodeDriver().resume()` now rejects such an id with `not a resumable session id:
+<id> was minted by this driver, not by the engine`. Only the driver that mints these can
+recognise one — above the driver seam a `claude-code-…` id is just a string — which is why
+the guard is here rather than in the consumer.
+
+**Rejecting, not quietly starting a fresh session.** A caller that handles a failed resume
+already has the right machinery: it catches, starts fresh, and says so. Returning a fresh
+session instead would hand that caller a session with no history while telling it the resume
+succeeded, and the owner would be talking to an agent that had silently forgotten
+everything. One lost conversation, reported, beats a conversation that cannot continue —
+or one that pretends it did.
+
+**Not `UnsupportedError`.** `ERR_UNSUPPORTED` is the contract's signal for `resume: false`,
+and the conformance suite grades it as such. This driver does resume; it refuses one id.
+Reusing the code would tell a caller the operation is unavailable, and a host that stops
+recording session ids when `capabilities.resume` is false would stop recording them
+altogether.
+
+The pattern is exactly what `nextSessionId` builds and nothing looser — `Date.now()` and the
+counter are both positive integers, so both segments are digits, and `claude-code-1-2-3` is
+not a match. An engine id is a UUID and cannot collide. `src/drivers/claude-code.fixtures.test.ts`
+pins the refusal, its message, that it is not an `UnsupportedError`, and that a UUID and six
+near misses still resume.
+
+No exported type changed, no capability flag changed, and `resume` stays `true`. The live
+conformance suite is unaffected: its resume scenario takes a full turn before it resumes, so
+the id it hands back is the engine's own.
+
 ## v0.2.0 — 2026-09-07
 
 **A session can now be asked to think harder.** `SessionOptions` gains an optional `effort`,

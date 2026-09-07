@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { getDriver, registerDriver } from '../registry'
 import type { AgentEvent } from '../types'
+import { UnsupportedError } from '../types'
 import type { NormalizerState } from './claude-code'
 import { createClaudeCodeDriver, createNormalizerState, normalizeSdkMessage } from './claude-code'
 
@@ -640,6 +641,64 @@ describe('createClaudeCodeDriver', () => {
     expect(session.status()).toBe('idle')
     expect(session.usage().turns).toBe(0)
     await session.close()
+  })
+
+  test('resume refuses a placeholder this driver minted, rather than poisoning every later turn', async () => {
+    // is4co/trellis#43. A session's id is a local placeholder until the engine
+    // reports its own; a first turn that dies before that ever happens (a key
+    // with no balance, a killed process) leaves the placeholder as the only id
+    // the host saw, and a host that persists session ids persists that one.
+    // Handed to `--resume` the CLI refuses it — on that turn and on every turn
+    // after it — so the workspace is dead, not merely un-resumed. Only the
+    // driver that minted the id can tell, so the refusal is here.
+    const driver = createClaudeCodeDriver()
+    const fresh = await driver.start({ worktree: WORKTREE })
+    const placeholder = fresh.id
+    expect(placeholder).toMatch(/^claude-code-\d+-\d+$/)
+    await fresh.close()
+
+    // A rejected promise, not a synchronous throw: `resume` returns
+    // Promise<Session>, and a throw would escape a caller's .catch().
+    const rejection = driver.resume(placeholder, { worktree: WORKTREE })
+    expect(rejection).toBeInstanceOf(Promise)
+    await expect(rejection).rejects.toThrow(
+      new RegExp(`^not a resumable session id: ${placeholder} was minted by this driver, not by the engine$`),
+    )
+  })
+
+  test('the refusal is not UnsupportedError, because the driver does resume', async () => {
+    // ERR_UNSUPPORTED is the contract's signal for `resume: false`, which the
+    // conformance suite grades. Reusing it here would tell a caller the driver
+    // cannot resume at all, and a host that keys off `capabilities.resume`
+    // would stop recording ids entirely. One id is refused, not the operation.
+    const driver = createClaudeCodeDriver()
+    expect(driver.capabilities.resume).toBe(true)
+    const caught = await driver
+      .resume('claude-code-1787617156728-1', { worktree: WORKTREE })
+      .then(() => null, (cause: unknown) => cause)
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught).not.toBeInstanceOf(UnsupportedError)
+    expect((caught as { code?: string }).code).toBeUndefined()
+  })
+
+  test('only the minted shape is refused; engine ids and near misses still resume', async () => {
+    // The engine names its sessions with a UUID, which cannot start
+    // 'claude-code-'. The near misses matter as much: the guard must not grow
+    // into a prefix ban that eats ids the engine could legitimately hand back.
+    const driver = createClaudeCodeDriver()
+    for (const id of [
+      '4d1f0b2a-3c5e-4f61-9a7b-0c2d8e6f1a34',
+      'claude-code',
+      'claude-code-1',
+      'claude-code-abc-1',
+      'claude-code-1-2-3',
+      'claude-code-1-2 ',
+      'x-claude-code-1-1',
+    ]) {
+      const session = await driver.resume(id, { worktree: WORKTREE })
+      expect(session.id).toBe(id)
+      await session.close()
+    }
   })
 
   test('a session that never sends starts idle, closes clean, and spawns no engine', async () => {
