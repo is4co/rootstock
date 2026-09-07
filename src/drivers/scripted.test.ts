@@ -18,8 +18,33 @@ function steps(...events: AgentEvent[]): ScriptedStep[] {
   return events.map((event) => ({ event }))
 }
 
-function settle(ms = 15): Promise<void> {
-  return new Promise((resolve) => { setTimeout(resolve, ms) })
+/**
+ * Let the replay drain before asserting on what arrived.
+ *
+ * `ms` is still a real wall-clock minimum, because some fixtures below author
+ * genuine `delayMs` gaps and the assertions about them need the time to pass.
+ * What this does NOT do any more is spend that time in a single timer.
+ *
+ * The reason: with `timeScale: 0` the driver pushes events as fast as the loop
+ * allows, and `collect()` consumes them in a detached `for await`. So what these
+ * assertions actually need is enough TURNS of the event loop for that consumer
+ * to be scheduled — not a duration. `bun test` runs test files concurrently, and
+ * under that contention one `setTimeout(resolve, 15)` can elapse with the
+ * consumer never having run at all. The failure then lands here, in tests about
+ * delta coalescing and event-for-event replay, while the cause is whatever file
+ * happened to be sharing the loop — which is a genuinely confusing way to lose
+ * an afternoon. Yielding repeatedly gives the consumer many chances instead of
+ * one, which is what makes these tests robust rather than lucky.
+ */
+async function settle(ms = 15): Promise<void> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => { setTimeout(resolve, 1) })
+  }
+  // A few more turns after the clock is satisfied, for the same reason.
+  for (let i = 0; i < 10; i += 1) {
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+  }
 }
 
 /** Drain the session's events into a box for the life of the test. */
@@ -228,6 +253,36 @@ describe('declared degradations — one per capability flag', () => {
     expect(deltas(seen).map((e) => e.text)).toEqual(['edited three files'])
     expect(turnEnds(seen).length).toBe(1)
     await session.close()
+  })
+
+  // Both branches, in one test, because the promised behavior is the same on
+  // each: accepted and ignored. A replay has no model, so there is nothing a
+  // level could change — what is being pinned is §2.5.3's "never an error",
+  // which is the half of the contract a host actually depends on when it sends
+  // a level to a driver that may not have one.
+  test('effortSelection: an effort is accepted and ignored on both branches, never an error', async () => {
+    const fixture: ScriptedFixture = {
+      version: 1,
+      turns: [{ steps: steps({ kind: 'message.delta', text: 'thought about it' }, END) }],
+    }
+
+    for (const declared of [true, false]) {
+      const driver = createScriptedDriver({
+        fixture,
+        timeScale: 0,
+        capabilities: { effortSelection: declared },
+      })
+      expect(driver.capabilities.effortSelection).toBe(declared)
+
+      const session = await driver.start({ worktree: WORKTREE, effort: 'max' })
+      const seen = collect(session)
+      await session.send('go')
+      await settle()
+
+      expect(deltas(seen).map((e) => e.text)).toEqual(['thought about it'])
+      expect(turnEnds(seen).length).toBe(1)
+      await session.close()
+    }
   })
 
   test('resume: false throws UnsupportedError; true continues at the next turn', async () => {

@@ -21,6 +21,7 @@ import type {
   Driver,
   InjectedTool,
   ModelTier,
+  ReasoningEffort,
   Session,
   SessionHooks,
   SessionOptions,
@@ -146,7 +147,7 @@ const DEFAULT_TURN_TIMEOUT_MS = 30_000
 // ---------------------------------------------------------------------------
 
 export interface ConformanceCheck {
-  /** One of the eighteen fixed ids: nine clause.* checks, nine cap.* checks. */
+  /** One of the nineteen fixed ids: nine clause.* checks, ten cap.* checks. */
   id: string
   ok: boolean
   detail?: string
@@ -166,6 +167,7 @@ export interface ConformanceSessionContext {
   tools: InjectedTool[]
   hooks: SessionHooks
   tier?: ModelTier['tier']
+  effort?: ReasoningEffort
 }
 
 export interface ConformanceOptions {
@@ -175,7 +177,7 @@ export interface ConformanceOptions {
   timeoutMsPerTurn?: number
   /**
    * A fresh session for each scenario. Default: driver.start({ worktree,
-   * tools, hooks, tier }). The suite calls it once per scenario — scenarios
+   * tools, hooks, tier, effort }). The suite calls it once per scenario — scenarios
    * must not share session state. This is where a caller wires whatever its
    * driver needs per scenario; `ctx.scenario` says which one is being opened.
    */
@@ -363,6 +365,7 @@ interface ResumeOutcome {
 interface ModelOutcome {
   error?: string
   tierAccepted: boolean
+  effortAccepted: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +431,11 @@ class ConformanceRun {
     return dir
   }
 
-  private async open(scenario: ConformanceScenario, tier?: ModelTier['tier']): Promise<{
+  private async open(
+    scenario: ConformanceScenario,
+    tier?: ModelTier['tier'],
+    effort?: ReasoningEffort,
+  ): Promise<{
     session: Session
     collector: Collector
     options: SessionOptions
@@ -440,12 +447,14 @@ class ConformanceRun {
       tools: [this.probe],
       hooks: this.hooks,
       ...(tier === undefined ? {} : { tier }),
+      ...(effort === undefined ? {} : { effort }),
     }
     const options: SessionOptions = {
       worktree,
       tools: ctx.tools,
       hooks: ctx.hooks,
       ...(tier === undefined ? {} : { tier }),
+      ...(effort === undefined ? {} : { effort }),
     }
     const session = this.opts.makeSession
       ? await this.opts.makeSession(ctx)
@@ -777,10 +786,14 @@ class ConformanceRun {
 
   /** A tier in SessionOptions must be accepted on both branches — never an error. */
   private async runModelSelection(): Promise<ModelOutcome> {
-    const outcome: ModelOutcome = { tierAccepted: false }
+    const outcome: ModelOutcome = { tierAccepted: false, effortAccepted: false }
     try {
-      const { session } = await this.open('modelSelection', 'deep')
+      // Tier and effort ride the same scenario: both are session parameters
+      // with no event of their own, so what there is to observe — that the
+      // session opens and closes — is observed once for the pair.
+      const { session } = await this.open('modelSelection', 'deep', 'high')
       outcome.tierAccepted = true
+      outcome.effortAccepted = true
       this.note(session)
       await this.closeQuietly(session)
     } catch (cause) {
@@ -1061,12 +1074,29 @@ class ConformanceRun {
       if (tiers.length !== 1) return `modelSelection: false promises exactly one tier; models() returned ${tiers.length}`
       return null
     })
+
+    // ACCEPTANCE ONLY, and deliberately so. Whether a model actually reasoned
+    // harder is not in rootstock's event vocabulary — there is no `effort` in
+    // any AgentEvent, and inventing one would be a driver leaking its engine.
+    // So this grades the half that IS a contract: both branches promise "never
+    // an error", and a driver that throws on a level it does not implement has
+    // broken the degradation rule whichever way it declared. What it cannot
+    // catch is a driver that declares `true` and silently drops the value; that
+    // is pinned per-driver instead — see claude-code.effort.test.ts, which reads
+    // the built options back.
+    this.grade('cap.effortSelection', () => {
+      if (model.error !== undefined) return `modelSelection scenario failed: ${model.error}`
+      if (!model.effortAccepted) {
+        return 'an effort passed in SessionOptions was rejected; an effort is honored or ignored, never an error'
+      }
+      return null
+    })
   }
 }
 
 /**
  * Grade a driver against the contract: nine clause checks that run for every
- * driver, and nine capability checks that grade whichever branch the driver
+ * driver, and ten capability checks that grade whichever branch the driver
  * declared. Never throws for a driver defect — a defect is a failing check.
  */
 export async function runConformance(driver: Driver, opts: ConformanceOptions = {}): Promise<ConformanceReport> {

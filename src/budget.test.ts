@@ -32,6 +32,7 @@ const FULL: DriverCapabilities = {
   toolInjection: true,
   costReporting: true,
   modelSelection: true,
+  effortSelection: true,
 }
 
 function settle(ms = 120): Promise<void> {

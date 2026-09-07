@@ -41,6 +41,7 @@ const ALL_FALSE: DriverCapabilities = {
   toolInjection: false,
   costReporting: false,
   modelSelection: false,
+  effortSelection: false,
 }
 
 /** Authored steps ending, as every fixture turn must, in a turn.end. */
@@ -215,6 +216,7 @@ function scriptedRig(capabilities: Partial<DriverCapabilities>, wrap?: (session:
       tools: ctx.tools,
       hooks: ctx.hooks,
       ...(ctx.tier === undefined ? {} : { tier: ctx.tier }),
+      ...(ctx.effort === undefined ? {} : { effort: ctx.effort }),
     }),
   }
 
@@ -296,25 +298,26 @@ const CONFIGS: { name: string; capabilities: Partial<DriverCapabilities> }[] = [
 
 describe('runConformance against the scripted driver', () => {
   for (const config of CONFIGS) {
-    test(`all 18 checks pass with ${config.name}`, async () => {
+    test(`all 19 checks pass with ${config.name}`, async () => {
       const rig = scriptedRig(config.capabilities)
       const report = await runConformance(rig.driver, rig.opts)
 
       expect(report.checks.filter((check) => !check.ok).map((check) => `${check.id}: ${String(check.detail)}`))
         .toEqual([])
       expect(report.ok).toBe(true)
-      expect(report.checks.length).toBe(18)
+      expect(report.checks.length).toBe(19)
       expect(report.driverId).toBe('scripted')
     })
   }
 
-  test('the report names nine clause checks and nine capability checks', async () => {
+  test('the report names nine clause checks and ten capability checks', async () => {
     const rig = scriptedRig({})
     const report = await runConformance(rig.driver, rig.opts)
     const ids = report.checks.map((check) => check.id)
     expect(ids.filter((id) => id.startsWith('clause.')).length).toBe(9)
-    expect(ids.filter((id) => id.startsWith('cap.')).length).toBe(9)
-    expect(new Set(ids).size).toBe(18)
+    expect(ids.filter((id) => id.startsWith('cap.')).length).toBe(10)
+    expect(ids).toContain('cap.effortSelection')
+    expect(new Set(ids).size).toBe(19)
   })
 })
 

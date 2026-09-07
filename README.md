@@ -64,13 +64,13 @@ maps it to `tool.other` rather than widening the union:
 `message.delta`, `file.edit`, `file.create`, `file.delete`, `command.run`,
 `command.output`, `tool.other`, `status`, `turn.end`, `error`
 
-The capability declaration is exactly nine flags:
+The capability declaration is exactly ten flags:
 
 `streamingText`, `fileEvents`, `resume`, `interrupt`, `interject`, `hooks`,
-`toolInjection`, `costReporting`, `modelSelection`
+`toolInjection`, `costReporting`, `modelSelection`, `effortSelection`
 
 Both counts are held in place by a type-level exhaustiveness assertion in `src/types.test.ts`,
-so adding an eleventh kind or a tenth flag fails the typecheck rather than drifting quietly.
+so adding an eleventh kind or an eleventh flag fails the typecheck rather than drifting quietly.
 
 `file.edit` carries `after` and an optional `range`, and the two are read together. `range`
 locates `after` in the file as it was **before** the edit: `startLine`/`endLine` are 1-based
@@ -97,6 +97,7 @@ skipped.
 | `toolInjection` | Injected tools are silently ignored. The agent works through code alone, which most tasks survive. |
 | `costReporting` | Token and cost fields are null. Budgets fall back to wall-clock and turn counts, which are always populated. |
 | `modelSelection` | `models()` returns exactly one tier and a requested tier is ignored, never an error. |
+| `effortSelection` | A requested `effort` is ignored, never an error. The session runs at the engine's default reasoning depth, exactly as if the field had been left unset. |
 
 The punchline: a homegrown script that satisfies only `streamingText` and `fileEvents` is a
 legitimate driver. Everything else degrades to something a consumer can live with, as long as
@@ -115,8 +116,8 @@ the declaration is honest.
 4. Register it: `registerDriver(driver)`. There is no import-time registration anywhere in this
    package, so `getDriver()` never depends on import order.
 5. Grade it: `runConformance(driver, opts)` from `src/conformance/index.ts`. A green run is the
-   entry bar — a driver that does not pass it is not finished. The suite runs eighteen checks:
-   nine contract clauses and nine capability flags, each flag graded on whichever branch you
+   entry bar — a driver that does not pass it is not finished. The suite runs nineteen checks:
+   nine contract clauses and ten capability flags, each flag graded on whichever branch you
    declared. It sees only the public interface, so engine-specific wiring lives in your
    `makeSession`, never in the suite.
 6. Do not implement spend caps. Budgets come free — the registry wraps every session that was
@@ -147,7 +148,7 @@ budget; a session opened without one is handed through exactly as the driver mad
 ### `claude-code` — the reference driver
 
 `src/drivers/claude-code.ts`. In-process on `@anthropic-ai/claude-agent-sdk`, declaring all
-nine capabilities. It is the driver the conformance suite was written against and the one to
+ten capabilities. It is the driver the conformance suite was written against and the one to
 read when writing another.
 
 Sessions run bare and permissive by design: no setting sources are loaded (`settingSources: []`),
@@ -157,7 +158,10 @@ per-tool prompt nobody is there to answer. Engine session state goes wherever th
 `configDir` points (`CLAUDE_CONFIG_DIR`); rootstock hardcodes no path, and leaving it unset uses
 the engine's own default. Model tiers are surfaced by name only — Haiku, Sonnet, Opus — with the
 tier-to-model mapping inside the driver, where a vendor bump is a rootstock release rather than a
-type change.
+type change. Reasoning depth works the same way: `SessionOptions.effort` names one of five levels
+and the driver maps it to the engine's own option, ungated by tier — the engine resolves it
+against the model actually serving each request. Rootstock chooses no level; unset means the
+engine is told nothing.
 
 **Licensing.** This driver runs on an organization API key, or on Bedrock or Vertex. Delegating a
 Claude.ai Pro or Max subscription to end users is explicitly not permitted, so a deployment
@@ -173,20 +177,27 @@ that develops the conformance suite itself. Token-free, network-free, no licensi
 ## What is exercised, and what is not
 
 Two layers, and the difference matters. Offline, `bun test` runs in-process against fixtures and
-fakes with no network and no key: 99 passing tests across 7 files, plus 4 skipped for want of a
+fakes with no network and no key: 111 passing tests across 10 files, plus 5 skipped for want of a
 key. Separately, on **2026-08-20**, the `claude-code` driver was run against the real engine.
 
 - **Exercised offline:** the event normalizer (`normalizeSdkMessage` is pure and graded directly
   on SDK-shaped inputs, including the pre-edit `range` it computes for every `Edit`), the
   registry and its budget seam, both budget caps and their fallbacks, the full conformance suite
-  against the `scripted` driver on both branches of all nine flags.
+  against the `scripted` driver on both branches of all ten flags.
 - **Exercised against the real engine** (`src/drivers/claude-code.live.test.ts`, run twice, clean
-  both times): all eighteen conformance checks, which covers every one of the nine declared
-  capabilities — `streamingText`, `fileEvents`, `resume`, `interrupt`, `interject`, `hooks`,
-  `toolInjection`, `costReporting` and `modelSelection`. Plus, as their own live tests, resume
-  continuity across a closed session, an interrupt mid-turn leaving the session idle and the
-  stream clean, and a real edit carrying a `range` that locates its own `before` text in the
+  both times): the eighteen conformance checks as they stood, which covered every one of the nine
+  capabilities declared then — `streamingText`, `fileEvents`, `resume`, `interrupt`, `interject`,
+  `hooks`, `toolInjection`, `costReporting` and `modelSelection`. Plus, as their own live tests,
+  resume continuity across a closed session, an interrupt mid-turn leaving the session idle and
+  the stream clean, and a real edit carrying a `range` that locates its own `before` text in the
   pre-edit file.
+- **Not yet exercised against the real engine:** the tenth capability, `effortSelection`, and the
+  nineteenth conformance check that grades it. Both were added after that run and the live suite
+  has not been re-run since. The claim they rest on — that the engine applies a requested effort
+  to whichever model is serving the request, and omits it for a model that has no such parameter
+  — is taken from the SDK's own type declarations, not from an observed run. The live test that
+  would settle it exists and is skipped for want of a key; a skipped run is an unverified
+  driver, not a passing one.
 - **Still offline-only:** everything outside the `claude-code` driver — the registry, the budget
   layer and the `scripted` driver are fixture-graded by design and have no live surface.
 

@@ -23,6 +23,7 @@ import type {
   DriverCapabilities,
   InjectedTool,
   ModelTier,
+  ReasoningEffort,
   Session,
   SessionHooks,
   SessionId,
@@ -69,7 +70,33 @@ const TIERS: ModelTier[] = [
 const DEFAULT_TIER: ModelTier['tier'] = 'fast'
 
 /**
- * All nine, matching §2.5.4. `resume`, `interrupt` and `interject` are real
+ * Rootstock's effort vocabulary → the engine's. Identity today, and written out
+ * anyway, for the same reason `TIER_MODELS` exists: it is the seam where a
+ * vendor rename stops.
+ *
+ * The value type is taken from the SDK's own option rather than restated, so if
+ * the engine drops a rung or spells one differently, this table fails `tsc` here
+ * — inside the driver, where a pin bump belongs — instead of failing at runtime
+ * or forcing a change to the published `ReasoningEffort` union.
+ *
+ * Confirmed against the installed SDK's declarations (`Options.effort`, typed
+ * `EffortLevel`) and against the Agent SDK's current published docs. Note the
+ * shape is the Agent SDK's: a TOP-LEVEL `effort` on the query options. The
+ * Messages API spells the same idea `output_config.effort`; that is a different
+ * product and its shape must never appear here.
+ */
+const SDK_EFFORT: Record<ReasoningEffort, NonNullable<Options['effort']>> = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  max: 'max',
+}
+
+/**
+ * All ten. Nine of them match §2.5.4's enumeration; `effortSelection` is the
+ * tenth, added with the reasoning knob (is4co/trellis#51) and not yet in the
+ * architecture doc. `resume`, `interrupt` and `interject` are real
  * here: resume re-opens the engine's own session by its `session_id`, interrupt
  * calls the query object's `interrupt()`, and interject feeds a note into the
  * live streaming input rather than buffering it for the next turn.
@@ -88,6 +115,7 @@ const CAPABILITIES: DriverCapabilities = {
   toolInjection: true,
   costReporting: true,
   modelSelection: true,
+  effortSelection: true,
 }
 
 /**
@@ -1143,6 +1171,7 @@ class ClaudeCodeSession implements Session {
   private buildOptions(): Options {
     const tools = this.options.tools ?? []
     const briefing = this.options.briefing?.trim()
+    const effort = this.options.effort
     return {
       cwd: this.options.worktree,
       ...(this.resumeFrom === undefined ? {} : { resume: this.resumeFrom }),
@@ -1172,6 +1201,24 @@ class ClaudeCodeSession implements Session {
       // Empty or whitespace-only is treated as absent rather than sent: a host
       // that has nothing to say should get today's behavior exactly.
       ...(briefing === undefined || briefing === '' ? {} : { systemPrompt: briefing }),
+      // How hard to think, when the host asked (§2.5.3 `effortSelection`). A
+      // TOP-LEVEL `effort` — that is the Agent SDK's shape; `output_config.effort`
+      // is the Messages API's and does not belong in this file.
+      //
+      // Unset stays unset: no key is emitted at all when the host names no level,
+      // so a caller that has no opinion gets the previous behavior byte for byte.
+      // Rootstock picks nothing on the host's behalf — a default here would land
+      // on `DEFAULT_TIER`, which is the cheapest tier, where more reasoning is
+      // precisely not the point.
+      //
+      // Deliberately NOT gated on `this.tier`. The engine resolves the parameter
+      // per request against the model actually serving it and omits it for a
+      // model that has none, which is the only place that decision is correct:
+      // a session can switch tier between turns via `setModel()`, so suppressing
+      // the level once at start would be wrong for every turn after the switch —
+      // and would suppress it in exactly the case that matters, a cheap-tier
+      // session whose owner picks a deeper model for one hard turn.
+      ...(effort === undefined ? {} : { effort: SDK_EFFORT[effort] }),
       ...(tools.length === 0 ? {} : { mcpServers: { [TOOL_SERVER_NAME]: buildToolServer(tools) } }),
       // Session JSONL lands where the caller says. Rootstock hardcodes no
       // volume path; trellis points this at its workbench volume (§2.2.4).

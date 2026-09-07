@@ -21,6 +21,25 @@ export interface ModelTier {
 }
 
 /**
+ * How hard the engine is asked to reason on each request. Five rungs, lowest
+ * to highest, spelled the way the vendor spells them.
+ *
+ * This is deliberately NOT the same kind of thing as `ModelTier`, which hides
+ * concrete model versions inside the driver (§9 decision 9). A model version is
+ * a release, and it changes when the vendor ships; an effort level is a piece of
+ * product semantics an owner asks for — "think harder about this" — and inventing
+ * different words for the same five rungs would buy nothing and cost a mapping
+ * nobody could reason about. What the tier rule actually protects against, a
+ * vendor rename leaking into the published contract, is protected here by the
+ * driver's own lookup table: if the engine renames or drops a rung, the driver
+ * fails to typecheck and this union stays as published.
+ *
+ * Rootstock never picks a value. Absent means the engine is told nothing and
+ * runs at its own default — see `SessionOptions.effort`.
+ */
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+/**
  * Tokens and cost. Used both per-turn (in `turn.end`) and cumulatively (from
  * `Session.usage()`). Token and cost fields are null when the driver declares
  * `costReporting: false`; wall-clock and turn count are always real, because
@@ -154,6 +173,15 @@ export interface DriverCapabilities {
    * ignored — never an error.
    */
   modelSelection: boolean
+  /**
+   * true: `SessionOptions.effort` reaches the engine on every query, including
+   * a resume, and is applied to whichever tier is active at the time. A model
+   * that cannot take the level runs at its own depth instead — the engine's
+   * own downgrade, never an error.
+   * false: a requested effort is ignored — never an error; the session runs at
+   * the engine's default depth, exactly as if the field had been left unset.
+   */
+  effortSelection: boolean
 }
 
 /** V1 has exactly one policy: the agent runs permissive inside its workspace
@@ -222,6 +250,29 @@ export interface SessionOptions {
    * degradation as `tools` and `hooks` (§2.5.3), never an error.
    */
   briefing?: string
+  /**
+   * How hard the engine is asked to reason. Session-scoped: it is resolved once
+   * here and re-sent on every `query()`, so it survives a resume exactly as
+   * `worktree` and `tier` do.
+   *
+   * **Rootstock never defaults this.** Absent means the engine is sent no effort
+   * setting at all and runs at its own default — today's behavior, byte for
+   * byte. Choosing a level is the host's decision, because only the host knows
+   * what a turn is for: the same constant that would read as "be thorough" on a
+   * deep-tier session is waste on a fast-tier one, and rootstock has no way to
+   * tell those apart. See `DriverCapabilities.effortSelection`.
+   *
+   * It is not gated by tier here. The level is handed over as asked and the
+   * engine applies it to whichever model is actually serving the request,
+   * omitting it on a model that has no such parameter. That is the only place
+   * the decision can be made correctly, because a session may switch tier
+   * between turns (§2.5.4) and a choice made once at start would be wrong for
+   * every turn after the switch.
+   *
+   * A driver that cannot carry it ignores it — the same silent degradation as
+   * `tools` and `hooks` (§2.5.3), never an error.
+   */
+  effort?: ReasoningEffort
 }
 
 /** Owners choose per session or per turn (§2.5.4). */

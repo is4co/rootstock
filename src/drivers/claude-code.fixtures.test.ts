@@ -597,7 +597,7 @@ describe('createClaudeCodeDriver', () => {
     expect(() => { registerDriver(driver) }).toThrow(/driver already registered: claude-code/)
   })
 
-  test('declares all nine — the full capability set of §2.5.4', () => {
+  test('declares all ten — §2.5.4\'s nine, plus the reasoning knob', () => {
     expect(createClaudeCodeDriver().capabilities).toEqual({
       streamingText: true,
       fileEvents: true,
@@ -608,6 +608,7 @@ describe('createClaudeCodeDriver', () => {
       toolInjection: true,
       costReporting: true,
       modelSelection: true,
+      effortSelection: true,
     })
   })
 

@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.2.0 — 2026-09-07
+
+**A session can now be asked to think harder.** `SessionOptions` gains an optional `effort`,
+and the `claude-code` driver passes it to the engine as its top-level `effort` option.
+
+**Breaking.** `DriverCapabilities` gains a tenth required flag, `effortSelection`. Every
+object typed as `DriverCapabilities` must now declare it, so this is a minor bump rather
+than a patch, and a driver written against v0.1.x will not typecheck until it does. The
+addition is mechanical — the compiler names every site — but it is a shape change to a
+published type, which is the one thing this package does not do quietly.
+
+Before this, the knob did not exist. The complete set of options the driver ever handed the
+SDK was `cwd`, `resume`, `model`, `permissionMode`, `allowDangerouslySkipPermissions`,
+`includePartialMessages`, `settingSources`, `disallowedTools`, `systemPrompt`, `mcpServers`
+and `env` — nothing about reasoning depth, and no pass-through for arbitrary SDK options.
+So every turn ran at whatever the engine defaulted to, and no host could change it without
+changing rootstock.
+
+The option name was confirmed against the installed SDK's own declarations and against the
+Agent SDK's current published documentation, rather than inferred. It is a **top-level**
+`effort` taking one of five levels, `low` through `max`. The Messages API spells the same
+idea `output_config.effort`; that is a different product, and the nested shape would reach
+no model while failing no typecheck — which is why the driver's tests assert its absence
+rather than trusting nobody will write it. `maxThinkingTokens` is deprecated in the
+installed declarations and is not this knob; `thinking` is a separate feature about
+thinking blocks and is untouched.
+
+**Rootstock picks no level.** Absent means no key is sent at all and the engine runs at its
+own default — the previous behavior byte for byte, the same bargain `briefing` makes. This
+is a deliberate departure from the shape the issue sketched, which put a hardcoded `high`
+next to `TIER_MODELS`. A constant there applies to every tier, and `DEFAULT_TIER` is the
+cheapest one, where more reasoning is precisely not the point. Which turns are worth
+thinking about is something only the host knows, so the host chooses.
+
+The level is **not gated on the tier**. It is handed over as asked and the engine resolves
+it against the model actually serving the request, omitting it where that model has no such
+parameter. That is the only place the decision can be made correctly, because a session can
+switch tier between turns: a choice made once at session start would be wrong for every turn
+after the switch, and would suppress the level in exactly the case the knob exists for — a
+cheap-tier session whose owner picks a deeper model for one hard turn. This rests on the
+SDK's type declarations rather than on an observed run; the live test that would settle it
+is written and skips without a key.
+
+`TurnOptions` is unchanged. The SDK does expose a mid-session path, but its precedence
+against the session-level option is undocumented and its `max` is session-scoped rather than
+per-turn, so per-turn effort is left for whoever can verify it against a live engine.
+
+The new flag carries the usual promise on both branches. `effortSelection: false` means a
+requested level is ignored — never an error — and the session runs at the engine's default
+depth exactly as if the field were unset. The conformance suite grades that, and grows from
+eighteen checks to nineteen: nine contract clauses and now ten capability flags. What the
+suite can honestly grade is acceptance, since nothing in the event vocabulary can observe
+that a model reasoned harder; that the value actually reaches the engine is pinned
+per-driver instead, by reading the built options back.
+
 ## v0.1.3 — 2026-08-24
 
 **A session can now be told the rules before its first turn.** `SessionOptions` gains an

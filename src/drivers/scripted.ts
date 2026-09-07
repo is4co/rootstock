@@ -61,7 +61,7 @@ export type ScriptedStep =
 export interface ScriptedDriverOptions {
   fixture: ScriptedFixture
   /**
-   * Defaults: all nine true. Every `false` changes behavior to the declared
+   * Defaults: all ten true. Every `false` changes behavior to the declared
    * degradation in DriverCapabilities' doc comments.
    */
   capabilities?: Partial<DriverCapabilities>
@@ -91,6 +91,11 @@ const FULL_CAPABILITIES: DriverCapabilities = {
   toolInjection: true,
   costReporting: true,
   modelSelection: true,
+  // A replay has no model, so there is nothing for a level to change: the field
+  // is accepted and ignored on BOTH branches of this flag, exactly as a
+  // requested tier is. `true` here is what lets the conformance suite grade the
+  // declared branch; `capabilities: { effortSelection: false }` grades the other.
+  effortSelection: true,
 }
 
 const SINGLE_TIER: ModelTier[] = [{ tier: 'balanced', label: 'Sonnet' }]

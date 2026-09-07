@@ -67,7 +67,7 @@ describe.skipIf(!HAS_KEY)('claude-code live conformance', () => {
 
       const failures = report.checks.filter((check) => !check.ok)
       expect(failures.map((check) => `${check.id}: ${check.detail ?? ''}`)).toEqual([])
-      expect(report.checks).toHaveLength(18)
+      expect(report.checks).toHaveLength(19)
       expect(report.ok).toBe(true)
     },
     900_000,
@@ -199,6 +199,43 @@ describe.skipIf(!HAS_KEY)('claude-code live session lifecycle', () => {
       const after = seen.indexOf(end as AgentEvent) + 1
       await new Promise((resolve) => { setTimeout(resolve, 500) })
       expect(seen.slice(after)).toEqual([])
+
+      await session.close()
+      expect(session.status()).toBe('dead')
+    },
+    600_000,
+  )
+
+  // The one claim in this change that types cannot settle. The driver hands
+  // `effort` over ungated and relies on the engine to resolve it against the
+  // model actually serving the request — omitting it for a model that has no
+  // such parameter. The installed SDK's own declarations say that is what
+  // happens (the hook input documents an effort "after any silent downgrade for
+  // the selected model", and the init frame documents a null "when no effort
+  // parameter will be sent"), but a type comment is the vendor describing its
+  // own CLI, not evidence. The fast tier is the case that matters, because it is
+  // the DEFAULT tier and the least likely to accept the parameter: if the engine
+  // rejected it rather than dropping it, every default-tier session of a host
+  // that sets an effort would fail on every request.
+  //
+  // A pass here says the turn completed with `effort: 'high'` on the cheapest
+  // tier. It says nothing about the model having thought harder — that is not
+  // observable in rootstock's vocabulary, by design. If this ever fails, the
+  // driver needs a tier gate and trellis needs the fallback noted in #51.
+  test(
+    'a fast-tier session opened with effort: high still completes a turn',
+    async () => {
+      const driver = createClaudeCodeDriver()
+      const worktree = await makeWorkspace()
+      const session = await driver.start({ worktree, tier: 'fast', effort: 'high' })
+      const seen = collect(session)
+
+      await session.send('Reply with just the word: ready. Do not use any tools.')
+      expect(await waitFor(() => turnEnds(seen).length >= 1, TURN_TIMEOUT_MS)).toBe(true)
+
+      const end = turnEnds(seen)[0]
+      expect(end?.stopReason).toBe('completed')
+      expect(textOf(seen).toLowerCase()).toContain('ready')
 
       await session.close()
       expect(session.status()).toBe('dead')

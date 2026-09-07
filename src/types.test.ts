@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import type { AgentEvent, DriverCapabilities, SessionStatus } from './types'
+import type { AgentEvent, DriverCapabilities, ReasoningEffort, SessionStatus } from './types'
 import { UnsupportedError } from './types'
 
 const EVENT_KINDS = [
@@ -9,33 +9,47 @@ const EVENT_KINDS = [
 
 const CAPABILITY_FLAGS = [
   'streamingText', 'fileEvents', 'resume', 'interrupt', 'interject',
-  'hooks', 'toolInjection', 'costReporting', 'modelSelection',
+  'hooks', 'toolInjection', 'costReporting', 'modelSelection', 'effortSelection',
 ] as const satisfies readonly (keyof DriverCapabilities)[]
 
-// Compile-time: adding an 11th kind or a 10th flag without updating these
+const EFFORT_LEVELS = [
+  'low', 'medium', 'high', 'xhigh', 'max',
+] as const satisfies readonly ReasoningEffort[]
+
+// Compile-time: adding an 11th kind or an 11th flag without updating these
 // lists breaks the assertions below, not just this test at runtime. The
 // `satisfies` lists above catch the other direction — a kind or flag REMOVED
 // from the contract while still listed here.
 type MissingKind = Exclude<AgentEvent['kind'], (typeof EVENT_KINDS)[number]>
 type MissingFlag = Exclude<keyof DriverCapabilities, (typeof CAPABILITY_FLAGS)[number]>
+type MissingEffort = Exclude<ReasoningEffort, (typeof EFFORT_LEVELS)[number]>
 
 // `T extends never` is what makes the check bite: an `Exclude<...>[]` variable
 // annotation does not, because `[]` is assignable to every array type.
 type Exhaustive<T extends never> = T
 export type _NoMissingKind = Exhaustive<MissingKind>
 export type _NoMissingFlag = Exhaustive<MissingFlag>
+export type _NoMissingEffort = Exhaustive<MissingEffort>
 
 const noMissingKind: MissingKind[] = []
 const noMissingFlag: MissingFlag[] = []
+const noMissingEffort: MissingEffort[] = []
 
 describe('the contract', () => {
   test('exactly 10 event kinds', () => {
     expect(EVENT_KINDS.length).toBe(10)
     expect(noMissingKind.length).toBe(0)
   })
-  test('exactly 9 capability flags', () => {
-    expect(CAPABILITY_FLAGS.length).toBe(9)
+  test('exactly 10 capability flags', () => {
+    expect(CAPABILITY_FLAGS.length).toBe(10)
     expect(noMissingFlag.length).toBe(0)
+  })
+  // Ordered lowest to highest, which is the only property of the union a
+  // caller can rely on beyond the spellings themselves.
+  test('exactly 5 reasoning effort levels, lowest to highest', () => {
+    expect(EFFORT_LEVELS.length).toBe(5)
+    expect(noMissingEffort.length).toBe(0)
+    expect([...EFFORT_LEVELS]).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
   test('exactly 5 session statuses', () => {
     const statuses: SessionStatus[] = ['idle', 'working', 'waiting', 'blocked', 'dead']
