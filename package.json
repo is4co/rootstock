@@ -9,7 +9,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "check": "oxlint --deny-warnings src && tsc --noEmit",
+    "check": "bun scripts/bun-version.ts && oxlint --deny-warnings src scripts && tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "bun test"
   },
